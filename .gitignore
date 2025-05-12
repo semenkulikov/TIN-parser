@@ -6,6 +6,13 @@ __pycache__/
 # C extensions
 *.so
 .cursor
+*.csv
+*.xlsx
+*.xls
+*.json
+*.jsonl
+*.jsonl.gz
+*.jsonl.gz.part
 
 # Distribution / packaging
 .Python
