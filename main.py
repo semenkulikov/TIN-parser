@@ -3,6 +3,8 @@ import logging
 import sys
 import signal
 import time
+import os
+import atexit
 from parser_base import DataManager, ParserManager, CompanyData
 from site_parsers import (
     FocusKonturParser,
@@ -18,6 +20,18 @@ logger = logging.getLogger("TIN_Parser.Main")
 # Глобальная переменная для хранения менеджера данных
 data_manager = None
 
+# Функция для форсированного сохранения при любом завершении
+@atexit.register
+def save_on_exit():
+    global data_manager
+    if data_manager:
+        try:
+            logger.info("Функция завершения работы - сохраняем результаты")
+            data_manager.save_results(force=True)
+            logger.info("Результаты успешно сохранены при завершении.")
+        except Exception as e:
+            logger.error(f"Ошибка при сохранении результатов при завершении: {e}")
+
 def signal_handler(sig, frame):
     """Обработчик сигнала прерывания (Ctrl+C)"""
     global data_manager
@@ -32,7 +46,8 @@ def signal_handler(sig, frame):
             logger.error(f"Ошибка при сохранении результатов: {e}")
     
     logger.info("Процесс был прерван пользователем")
-    sys.exit(130)
+    
+    os._exit(0)  # Немедленное завершение без вызова деструкторов (может помочь избежать ошибок при закрытии)
 
 async def main():
     """Основная функция парсера"""
@@ -60,7 +75,7 @@ async def main():
         parser_manager = ParserManager(data_manager)
         
         # Добавление парсеров для каждого сайта
-        parser_manager.add_parser(FocusKonturParser(rate_limit=2.0))
+        parser_manager.add_parser(FocusKonturParser(rate_limit=5.0))
         # parser_manager.add_parser(CheckoParser(rate_limit=2.0))
         # parser_manager.add_parser(ZaChestnyiBiznesParser(rate_limit=3.0))
         # parser_manager.add_parser(AuditItParser(rate_limit=2.0))
@@ -106,4 +121,7 @@ if __name__ == "__main__":
         sys.exit(exit_code)
     except KeyboardInterrupt:
         logger.info("Процесс был прерван пользователем")
-        sys.exit(130) 
+        sys.exit(0)  # Используем код 0 вместо 130
+    except Exception as e:
+        logger.error(f"Необработанная ошибка: {e}")
+        sys.exit(1) 
