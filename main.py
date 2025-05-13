@@ -16,7 +16,7 @@ logger = logging.getLogger("TIN_Parser.Main")
 async def main():
     """Основная функция парсера"""
     # Проверка аргументов командной строки
-    input_file = "excel_db.xlsx"
+    input_file = "test.xlsx"
     output_file = "results.csv"
     
     if len(sys.argv) > 1:
@@ -35,10 +35,10 @@ async def main():
         
         # Добавление парсеров для каждого сайта
         parser_manager.add_parser(FocusKonturParser(rate_limit=2.0))
-        parser_manager.add_parser(CheckoParser(rate_limit=2.0))
-        parser_manager.add_parser(ZaChestnyiBiznesParser(rate_limit=3.0))
-        parser_manager.add_parser(AuditItParser(rate_limit=2.0))
-        parser_manager.add_parser(RbcCompaniesParser(rate_limit=2.0))
+        # parser_manager.add_parser(CheckoParser(rate_limit=2.0))
+        # parser_manager.add_parser(ZaChestnyiBiznesParser(rate_limit=3.0))
+        # parser_manager.add_parser(AuditItParser(rate_limit=2.0))
+        # parser_manager.add_parser(RbcCompaniesParser(rate_limit=2.0))
         
         # Запуск процесса парсинга
         await parser_manager.run()
