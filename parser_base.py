@@ -2,9 +2,12 @@ import logging
 import asyncio
 import pandas as pd
 import os
+import time
 from typing import Dict, List, Optional, Tuple, Any, Set
 import json
 from pathlib import Path
+from datetime import datetime
+from tqdm import tqdm
 
 # Настройка логирования
 logging.basicConfig(
@@ -20,7 +23,7 @@ logger = logging.getLogger("TIN_Parser")
 class CompanyData:
     """Класс для хранения данных о компании"""
     
-    def __init__(self, name: str, inn: str):
+    def __init__(self, name: str, inn: str, ogrn: Optional[str] = None, address: Optional[str] = None, ceo_name: Optional[str] = None, ceo_inn: Optional[str] = None):
         self.name = name
         self.inn = inn
         self.chairman_name: Optional[str] = None
@@ -49,12 +52,15 @@ class CompanyData:
 class DataManager:
     """Менеджер данных для работы с Excel и сохранением результатов"""
     
-    def __init__(self, input_file: str, output_file: str = "results.csv"):
+    def __init__(self, input_file: str, output_file: str = "results.csv", save_interval: int = 50):
         self.input_file = input_file
         self.output_file = output_file
         self.cache_file = "parsed_data_cache.json"
         self.processed_inns: Set[str] = set()
         self.results: Dict[str, CompanyData] = {}
+        self.save_interval = save_interval  # Сохранять каждые N обработанных компаний
+        self.last_save_time = time.time()
+        self.save_results_counter = 0
         self._load_cache()
     
     def read_input_data(self) -> pd.DataFrame:
@@ -92,32 +98,61 @@ class DataManager:
         logger.info(f"Подготовлено {len(companies)} компаний для обработки")
         return companies
     
-    def save_results(self) -> None:
+    def save_results(self, force: bool = False) -> None:
         """Сохранение результатов в CSV"""
-        logger.info(f"Сохранение результатов в {self.output_file}")
-        try:
-            # Преобразование результатов в DataFrame
-            results_df = pd.DataFrame([company.to_dict() for company in self.results.values()])
+        # Если нет новых результатов и не форсированное сохранение, пропускаем
+        if not force and self.save_results_counter == 0:
+            return
             
-            # Если файл существует, объединяем с исходными данными
-            if os.path.exists(self.output_file):
-                existing_df = pd.read_csv(self.output_file, encoding='utf-8')
-                # Удаляем дубликаты по ИНН
-                results_df = pd.concat([existing_df, results_df]).drop_duplicates(subset=['ИНН'], keep='last')
-            
-            # Сохраняем результаты
-            results_df.to_csv(self.output_file, index=False, encoding='utf-8')
-            logger.info(f"Результаты успешно сохранены, всего записей: {len(results_df)}")
-            
-            # Обновляем кэш обработанных ИНН
-            self._save_cache()
-        except Exception as e:
-            logger.error(f"Ошибка при сохранении результатов: {e}")
+        current_time = time.time()
+        # Проверяем, прошло ли достаточно времени с последнего сохранения
+        # Или достигнут ли интервал обработанных компаний
+        if force or self.save_results_counter >= self.save_interval or (current_time - self.last_save_time) > 300:  # 5 минут
+            logger.info(f"Сохранение результатов в {self.output_file} (обработано: {self.save_results_counter} после предыдущего сохранения)")
+            try:
+                # Преобразование результатов в DataFrame
+                results_df = pd.DataFrame([company.to_dict() for company in self.results.values()])
+                
+                # Если нет результатов для сохранения, ничего не делаем
+                if results_df.empty:
+                    logger.warning("Нет результатов для сохранения")
+                    return
+                
+                # Создаем пустой файл с заголовками, если его нет
+                if not os.path.exists(self.output_file) or os.path.getsize(self.output_file) == 0:
+                    logger.info(f"Создаем новый файл {self.output_file}")
+                    results_df.to_csv(self.output_file, index=False, encoding='utf-8')
+                else:
+                    try:
+                        # Если файл существует, пробуем объединить с исходными данными
+                        existing_df = pd.read_csv(self.output_file, encoding='utf-8')
+                        # Удаляем дубликаты по ИНН
+                        results_df = pd.concat([existing_df, results_df]).drop_duplicates(subset=['ИНН'], keep='last')
+                    except Exception as e:
+                        logger.warning(f"Не удалось прочитать существующий файл, создаем новый: {e}")
+                    
+                    # Сохраняем результаты
+                    results_df.to_csv(self.output_file, index=False, encoding='utf-8')
+                
+                logger.info(f"Результаты успешно сохранены, всего записей: {len(results_df)}")
+                
+                # Обновляем кэш обработанных ИНН
+                self._save_cache()
+                
+                # Сбрасываем счетчик и обновляем время последнего сохранения
+                self.save_results_counter = 0
+                self.last_save_time = time.time()
+            except Exception as e:
+                logger.error(f"Ошибка при сохранении результатов: {e}")
     
     def update_results(self, company: CompanyData) -> None:
         """Обновление результатов"""
         self.results[company.inn] = company
         self.processed_inns.add(company.inn)
+        self.save_results_counter += 1
+        
+        # Автоматически сохраняем результаты, если достигнут интервал
+        self.save_results(force=False)
     
     def _load_cache(self) -> None:
         """Загрузка кэша обработанных ИНН"""
@@ -130,8 +165,11 @@ class DataManager:
                     # Загрузка результатов, если они есть
                     if 'results' in cache_data:
                         for data in cache_data['results']:
-                            company = CompanyData.from_dict(data)
-                            self.results[company.inn] = company
+                            try:
+                                company = CompanyData.from_dict(data)
+                                self.results[company.inn] = company
+                            except Exception as e:
+                                logger.warning(f"Не удалось загрузить данные компании из кэша: {e}")
                             
                 logger.info(f"Загружен кэш с {len(self.processed_inns)} обработанными ИНН")
             except Exception as e:
@@ -142,6 +180,15 @@ class DataManager:
     def _save_cache(self) -> None:
         """Сохранение кэша обработанных ИНН"""
         try:
+            # Создаем резервную копию кэша перед перезаписью
+            if os.path.exists(self.cache_file):
+                backup_file = f"{self.cache_file}.bak"
+                try:
+                    with open(self.cache_file, 'r', encoding='utf-8') as src, open(backup_file, 'w', encoding='utf-8') as dst:
+                        dst.write(src.read())
+                except Exception as e:
+                    logger.warning(f"Не удалось создать резервную копию кэша: {e}")
+            
             cache_data = {
                 'processed_inns': list(self.processed_inns),
                 'results': [company.to_dict() for company in self.results.values()]
@@ -203,6 +250,7 @@ class ParserManager:
         self.data_manager = data_manager
         self.parsers: List[BaseSiteParser] = []
         self.logger = logging.getLogger("TIN_Parser.Manager")
+        self.batch_size = 100  # Размер пакета компаний для обработки
     
     def add_parser(self, parser: BaseSiteParser) -> None:
         """Добавление парсера"""
@@ -227,6 +275,21 @@ class ParserManager:
         
         return parser_companies
     
+    async def process_batch(self, parser: BaseSiteParser, companies: List[CompanyData]) -> None:
+        """Обработка пакета компаний одним парсером"""
+        try:
+            results = await parser.parse_companies(companies)
+            self.logger.info(f"Парсер {parser.site_name} завершил обработку пакета, обработано: {len(results)} компаний")
+            
+            # Обновляем результаты
+            for company in results:
+                self.data_manager.update_results(company)
+                
+            # Принудительно сохраняем результаты после каждого пакета
+            self.data_manager.save_results(force=True)
+        except Exception as e:
+            self.logger.error(f"Ошибка при обработке пакета парсером {parser.site_name}: {e}")
+    
     async def run(self) -> None:
         """Запуск процесса парсинга"""
         self.logger.info("Начало процесса парсинга")
@@ -240,25 +303,22 @@ class ParserManager:
         # Распределяем компании между парсерами
         parser_companies = self.distribute_companies(companies)
         
-        # Создаем и запускаем задачи для каждого парсера
+        # Обрабатываем компании пакетами
         tasks = []
         for parser, assigned_companies in parser_companies.items():
-            if assigned_companies:
-                task = asyncio.create_task(parser.parse_companies(assigned_companies))
-                tasks.append((parser, task))
+            if not assigned_companies:
+                continue
+                
+            # Разбиваем компании на пакеты для каждого парсера
+            for i in range(0, len(assigned_companies), self.batch_size):
+                batch = assigned_companies[i:i+self.batch_size]
+                task = asyncio.create_task(self.process_batch(parser, batch))
+                tasks.append(task)
         
         # Ожидаем завершения всех задач
-        for parser, task in tasks:
-            try:
-                results = await task
-                self.logger.info(f"Парсер {parser.site_name} завершил работу, обработано: {len(results)} компаний")
-                
-                # Обновляем результаты
-                for company in results:
-                    self.data_manager.update_results(company)
-            except Exception as e:
-                self.logger.error(f"Ошибка при работе парсера {parser.site_name}: {e}")
+        if tasks:
+            await asyncio.gather(*tasks)
         
-        # Сохраняем результаты
-        self.data_manager.save_results()
+        # Финальное сохранение результатов
+        self.data_manager.save_results(force=True)
         self.logger.info("Процесс парсинга завершен") 
