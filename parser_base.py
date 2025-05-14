@@ -8,6 +8,7 @@ import json
 from pathlib import Path
 from datetime import datetime
 from tqdm import tqdm
+import concurrent.futures
 
 # Настройка логирования
 logging.basicConfig(
@@ -355,6 +356,21 @@ class ParserManager:
         except Exception as e:
             self.logger.error(f"Ошибка при обработке пакета парсером {parser.site_name}: {e}")
     
+    def process_batch_sync(self, parser: BaseSiteParser, companies: List[CompanyData]) -> None:
+        """ Синхронная обертка, инициализирует запуск парсера. """
+        try:
+            results = asyncio.run(parser.parse_companies(companies))
+            self.logger.info(f"Парсер {parser.site_name} завершил обработку пакета")
+            
+            # Обновляем результаты
+            for company in results:
+                self.data_manager.update_results(company)
+                
+            # Принудительно сохраняем результаты после каждого пакета
+            self.data_manager.save_results(force=True)
+        except Exception as e:
+            self.logger.error(f"Ошибка при обработке пакета парсером {parser.site_name}: {e}")
+    
     async def run(self) -> None:
         """Запуск процесса парсинга"""
         self.logger.info("Начало процесса парсинга")
@@ -368,21 +384,36 @@ class ParserManager:
         # Распределяем компании между парсерами
         parser_companies = self.distribute_companies(companies)
         
-        # Обрабатываем компании пакетами
-        tasks = []
-        for parser, assigned_companies in parser_companies.items():
-            if not assigned_companies:
-                continue
+        # # Обрабатываем компании пакетами
+        # tasks = []
+        # for parser, assigned_companies in parser_companies.items():
+        #     if not assigned_companies:
+        #         continue
                 
-            # Разбиваем компании на пакеты для каждого парсера
-            for i in range(0, len(assigned_companies), self.batch_size):
-                batch = assigned_companies[i:i+self.batch_size]
-                task = asyncio.create_task(self.process_batch(parser, batch))
-                tasks.append(task)
+        #     # Разбиваем компании на пакеты для каждого парсера
+        #     for i in range(0, len(assigned_companies), self.batch_size):
+        #         batch = assigned_companies[i:i+self.batch_size]
+        #         task = asyncio.create_task(self.process_batch(parser, batch))
+        #         tasks.append(task)
         
-        # Ожидаем завершения всех задач
-        if tasks:
-            await asyncio.gather(*tasks)
+        # # Ожидаем завершения всех задач
+        # if tasks:
+        #     await asyncio.gather(*tasks)
+
+        tasks = []
+        with concurrent.futures.ProcessPoolExecutor(max_workers=3) as executor:
+            loop = asyncio.get_event_loop()
+            for parser_class, assigned_companies in parser_companies.items():
+                if not assigned_companies:
+                    continue
+
+                batches = [assigned_companies[i:i + self.batch_size] for i in range(0, len(assigned_companies), self.batch_size)]
+                for batch in batches:
+                    task = loop.run_in_executor(executor, self.process_batch_sync, parser_class, batch)
+                    tasks.append(task)
+
+            if tasks:
+                await asyncio.gather(*tasks)
         
         # Финальное сохранение результатов
         self.data_manager.save_results(force=True)

@@ -41,9 +41,9 @@ class FocusKonturParser(BaseSiteParser):
         self.search_button_xpath = "/html/body/div[2]/div[2]/div/div/div/noindex/div/div/div[1]/div[2]/div/div/div[1]/div/button"
         
         # Настройки таймаутов и ожидания
-        self.page_load_timeout = 30  # Таймаут загрузки страницы (секунды)
-        self.wait_timeout = 25  # Таймаут для ожидания элементов (секунды)
-        self.wait_after_search = 5  # Ожидание после поиска (секунды)
+        self.page_load_timeout = 60  # Таймаут загрузки страницы (секунды)
+        self.wait_timeout = 10  # Таймаут для ожидания элементов (секунды)
+        self.wait_after_search = 10  # Ожидание после поиска (секунды)
         
         # Регулярные выражения для извлечения данных
         self.chairman_pattern = re.compile(r'(?:Председатель|Директор)[^\n]*\n([А-ЯЁ][а-яё]+ [А-ЯЁ][а-яё]+ [А-ЯЁ][а-яё]+)')
@@ -180,6 +180,14 @@ class FocusKonturParser(BaseSiteParser):
                     self.logger.warning(f"Сайт focus.kontur.ru заблокировал парсер.")
                     return None
                 
+                # # Если мы на странице "ничего не найдено"
+                # if 'проверьте запрос на ошибки' in self.driver.page_source.lower():
+                #     self.logger.warning(f"Компания {company.inn} не найдена на focus.kontur.ru")
+                #     # Возвращаем данные с отметкой "не найдено"
+                #     company.chairman_name = "не найдено"
+                #     company.chairman_inn = "не найдено"
+                #     return company
+                
                 # Ждем загрузки поля поиска
                 try:
                     search_input = self.wait.until(EC.presence_of_element_located((By.XPATH, self.search_input_xpath)))
@@ -209,7 +217,7 @@ class FocusKonturParser(BaseSiteParser):
                 try:
                     # Ждем появления страницы компании или страницы "ничего не найдено"
                     self.wait.until(lambda d: 'entity' in d.current_url or 'проверьте запрос на ошибки' in d.page_source.lower() or 'data:' in d.current_url)
-                    
+
                     # Проверка на некорректный URL
                     if self.driver.current_url.startswith('data:'):
                         self.logger.error(f"Браузер вернул data: URL после поиска")
@@ -226,7 +234,7 @@ class FocusKonturParser(BaseSiteParser):
                     await asyncio.sleep(self.wait_after_search)
                     
                     # Если мы на странице "ничего не найдено"
-                    if 'ничего не найдено' in self.driver.page_source.lower():
+                    if 'проверьте запрос на ошибки' in self.driver.page_source.lower():
                         self.logger.warning(f"Компания {company.inn} не найдена на focus.kontur.ru")
                         # Возвращаем данные с отметкой "не найдено"
                         company.chairman_name = "не найдено"
