@@ -52,7 +52,7 @@ class CompanyData:
 class DataManager:
     """Менеджер данных для работы с Excel и сохранением результатов"""
     
-    def __init__(self, input_file: str, output_file: str = "results.csv", save_interval: int = 50):
+    def __init__(self, input_file: str, output_file: str = "results.csv", save_interval: int = 2):
         self.input_file = input_file
         self.output_file = output_file
         self.cache_file = "parsed_data_cache.json"
@@ -61,6 +61,7 @@ class DataManager:
         self.save_interval = save_interval  # Сохранять каждые N обработанных компаний
         self.last_save_time = time.time()
         self.save_results_counter = 0
+        self.runtime_results: Dict[str, CompanyData] = {}  # Результаты текущего запуска
         self._load_cache()
     
     def read_input_data(self) -> pd.DataFrame:
@@ -99,60 +100,118 @@ class DataManager:
         return companies
     
     def save_results(self, force: bool = False) -> None:
-        """Сохранение результатов в CSV"""
+        """
+        Сохранение результатов в кэш и CSV.
+        
+        Args:
+            force: Принудительное сохранение независимо от счетчика
+        """
         # Если нет новых результатов и не форсированное сохранение, пропускаем
-        if not force and self.save_results_counter == 0:
+        if not force and self.save_results_counter == 0 and not self.runtime_results:
+            logger.debug("Нет новых результатов для сохранения, пропускаем")
             return
-            
+        
+        # Проверяем условия для сохранения
         current_time = time.time()
-        # Проверяем, прошло ли достаточно времени с последнего сохранения
-        # Или достигнут ли интервал обработанных компаний
-        if force or self.save_results_counter >= self.save_interval or (current_time - self.last_save_time) > 300:  # 5 минут
-            logger.info(f"Сохранение результатов в {self.output_file} (обработано: {self.save_results_counter} после предыдущего сохранения)")
+        should_save = (
+            force or 
+            self.save_results_counter >= self.save_interval or 
+            (current_time - self.last_save_time) > 300  # 5 минут
+        )
+        
+        if should_save:
+            logger.info(f"Сохранение результатов (обработано: {self.save_results_counter} после предыдущего сохранения)")
+            
             try:
-                # Преобразование результатов в DataFrame
-                results_df = pd.DataFrame([company.to_dict() for company in self.results.values()])
+                # 1. Сначала обновляем основной словарь результатов и множество обработанных ИНН
+                for inn, company in self.runtime_results.items():
+                    self.results[inn] = company
+                    self.processed_inns.add(inn)
                 
-                # Если нет результатов для сохранения, ничего не делаем
-                if results_df.empty:
-                    logger.warning("Нет результатов для сохранения")
-                    return
-                
-                # Создаем пустой файл с заголовками, если его нет
-                if not os.path.exists(self.output_file) or os.path.getsize(self.output_file) == 0:
-                    logger.info(f"Создаем новый файл {self.output_file}")
-                    results_df.to_csv(self.output_file, index=False, encoding='utf-8')
-                else:
-                    try:
-                        # Если файл существует, пробуем объединить с исходными данными
-                        existing_df = pd.read_csv(self.output_file, encoding='utf-8')
-                        # Удаляем дубликаты по ИНН
-                        results_df = pd.concat([existing_df, results_df]).drop_duplicates(subset=['ИНН'], keep='last')
-                    except Exception as e:
-                        logger.warning(f"Не удалось прочитать существующий файл, создаем новый: {e}")
-                    
-                    # Сохраняем результаты
-                    results_df.to_csv(self.output_file, index=False, encoding='utf-8')
-                
-                logger.info(f"Результаты успешно сохранены, всего записей: {len(results_df)}")
-                
-                # Обновляем кэш обработанных ИНН
+                # 2. Сохраняем в кэш
                 self._save_cache()
+                logger.info(f"Кэш обновлён с {len(self.runtime_results)} новыми записями")
                 
-                # Сбрасываем счетчик и обновляем время последнего сохранения
+                # 3. Если нужно сохранить в CSV (делаем это только при force=True или периодически)
+                if force:
+                    # Сохраняем в CSV
+                    self._save_to_csv()
+                
+                # 4. Сбрасываем счетчик и обновляем время последнего сохранения
                 self.save_results_counter = 0
                 self.last_save_time = time.time()
+                
+                # НЕ очищаем runtime_results - это делается только при успешном завершении всего процесса
+                
             except Exception as e:
                 logger.error(f"Ошибка при сохранении результатов: {e}")
     
+    def _save_to_csv(self) -> None:
+        """Сохранение результатов в CSV файл"""
+        try:
+            # Проверяем, что есть результаты для сохранения
+            if not self.results:
+                logger.warning("Нет результатов для сохранения в CSV")
+                return
+            
+            logger.info(f"Сохранение результатов в CSV файл {self.output_file}")
+            
+            # Преобразование результатов в DataFrame
+            results_df = pd.DataFrame([company.to_dict() for company in self.results.values()])
+            
+            # Создаем пустой файл с заголовками, если его нет
+            if not os.path.exists(self.output_file) or os.path.getsize(self.output_file) == 0:
+                logger.info(f"Создаем новый файл {self.output_file}")
+                results_df.to_csv(self.output_file, index=False, encoding='utf-8')
+            else:
+                try:
+                    # Если файл существует, читаем его
+                    existing_df = pd.read_csv(self.output_file, encoding='utf-8')
+                    
+                    # Объединяем с текущими результатами, избегая дублирования
+                    merged_data = {}
+                    
+                    # Сначала добавляем все записи из текущих результатов
+                    for _, row in results_df.iterrows():
+                        inn = str(row['ИНН'])
+                        merged_data[inn] = row.to_dict()
+                    
+                    # Затем добавляем записи из существующего файла, если их нет в текущих результатах
+                    for _, row in existing_df.iterrows():
+                        inn = str(row['ИНН'])
+                        if inn not in merged_data:
+                            merged_data[inn] = row.to_dict()
+                    
+                    # Создаем новый DataFrame из объединенных данных
+                    final_df = pd.DataFrame(list(merged_data.values()))
+                    
+                    # Сохраняем результаты
+                    final_df.to_csv(self.output_file, index=False, encoding='utf-8')
+                    logger.info(f"Результаты успешно сохранены в CSV, всего записей: {len(final_df)}")
+                except Exception as e:
+                    logger.warning(f"Не удалось прочитать существующий файл, создаем новый: {e}")
+                    results_df.to_csv(self.output_file, index=False, encoding='utf-8')
+                    logger.info(f"Результаты успешно сохранены в CSV, всего записей: {len(results_df)}")
+        except Exception as e:
+            logger.error(f"Ошибка при сохранении результатов в CSV: {e}")
+    
     def update_results(self, company: CompanyData) -> None:
-        """Обновление результатов"""
-        self.results[company.inn] = company
-        self.processed_inns.add(company.inn)
+        """
+        Обновление результатов парсинга компании.
+        
+        Args:
+            company: Данные о компании
+        """
+        # Сохраняем результат текущего запуска
+        self.runtime_results[company.inn] = company
+        
+        # Увеличиваем счетчик обработанных записей
         self.save_results_counter += 1
         
-        # Автоматически сохраняем результаты, если достигнут интервал
-        self.save_results(force=False)
+        # Если достигнут интервал сохранения - сохраняем в кэш
+        if self.save_results_counter >= self.save_interval:
+            logger.info(f"Достигнут интервал сохранения ({self.save_interval}), сохраняем промежуточные результаты")
+            self.save_results(force=False)
     
     def _load_cache(self) -> None:
         """Загрузка кэша обработанных ИНН"""
@@ -176,6 +235,7 @@ class DataManager:
                 logger.error(f"Ошибка при загрузке кэша: {e}")
                 self.processed_inns = set()
                 self.results = {}
+                self.runtime_results = {}
     
     def _save_cache(self) -> None:
         """Сохранение кэша обработанных ИНН"""
@@ -188,6 +248,11 @@ class DataManager:
                         dst.write(src.read())
                 except Exception as e:
                     logger.warning(f"Не удалось создать резервную копию кэша: {e}")
+            
+            # Обновляем результаты из текущего запуска
+            for inn, company in self.runtime_results.items():
+                self.results[inn] = company
+                self.processed_inns.add(inn)
             
             cache_data = {
                 'processed_inns': list(self.processed_inns),
@@ -250,7 +315,7 @@ class ParserManager:
         self.data_manager = data_manager
         self.parsers: List[BaseSiteParser] = []
         self.logger = logging.getLogger("TIN_Parser.Manager")
-        self.batch_size = 100  # Размер пакета компаний для обработки
+        self.batch_size = 20  # Размер пакета компаний для обработки
     
     def add_parser(self, parser: BaseSiteParser) -> None:
         """Добавление парсера"""

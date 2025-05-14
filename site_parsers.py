@@ -15,12 +15,12 @@ from selenium.webdriver.common.keys import Keys
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
 from selenium.common.exceptions import TimeoutException, NoSuchElementException, WebDriverException, StaleElementReferenceException
-from parser_base import BaseSiteParser, CompanyData
+from parser_base import BaseSiteParser, CompanyData, DataManager
 
 class FocusKonturParser(BaseSiteParser):
     """Парсер для сайта focus.kontur.ru"""
     
-    def __init__(self, rate_limit: float = 2.0, max_retries: int = 3):
+    def __init__(self, rate_limit: float = 2.0, max_retries: int = 1):
         super().__init__(rate_limit)
         self.site_name = "focus.kontur.ru"
         self.search_url = "https://focus.kontur.ru/search?country=RU"
@@ -28,10 +28,10 @@ class FocusKonturParser(BaseSiteParser):
         
         # Настройка Chrome
         self.options = Options()
-        self.options.add_argument('--headless')  # Запуск в фоновом режиме
+        # self.options.add_argument('--headless')  # Запуск в фоновом режиме
         self.options.add_argument('--no-sandbox')
         self.options.add_argument('--disable-dev-shm-usage')
-        self.options.add_argument('--disable-gpu')
+        # self.options.add_argument('--disable-gpu')
         self.options.add_argument('--ignore-certificate-errors')
         self.options.add_argument('--ignore-ssl-errors')
         self.options.add_argument('--log-level=3')  # Уменьшаем вывод логов браузера
@@ -74,6 +74,9 @@ class FocusKonturParser(BaseSiteParser):
             self.driver.set_page_load_timeout(self.page_load_timeout)
             self.wait = WebDriverWait(self.driver, self.wait_timeout)
             
+            # Получаем ссылку на data_manager для обновления результатов
+            data_manager = self._get_data_manager()
+            
             # Обработка всех компаний
             for i, company in enumerate(companies):
                 try:
@@ -99,13 +102,20 @@ class FocusKonturParser(BaseSiteParser):
                         result.source = self.site_name
                         results.append(result)
                         self.logger.info(f"Успешно получены данные для {company.name}")
+                        
+                        # Обновляем результаты в data_manager если он доступен
+                        if data_manager:
+                            data_manager.update_results(result)
                     else:
                         self.logger.warning(f"Не удалось получить данные для {company.name}")
                         
                     # После каждой 10-й компании проверяем, жив ли браузер
                     if (i + 1) % 10 == 0:
+                        self.logger.info(f"Проверка активности браузера... ([{i+1}/{len(companies)}])")
                         try:
-                            self.driver.current_url  # Проверка активности браузера
+                            self.driver.current_url
+                            if "https" not in self.driver.current_url:
+                                raise WebDriverException  # Проверка активности браузера
                         except WebDriverException:
                             self.logger.warning("Браузер перестал отвечать, перезапускаем")
                             if self.driver:
@@ -140,16 +150,49 @@ class FocusKonturParser(BaseSiteParser):
     
     async def parse_company(self, company: CompanyData) -> Optional[CompanyData]:
         """Парсит информацию о председателе компании с сайта focus.kontur.ru"""
-        max_attempts = 3  # Максимальное количество попыток при ошибках
         
-        for attempt in range(max_attempts):
+        for attempt in range(self.max_retries):
             try:
                 # Открываем страницу поиска
-                self.logger.info(f"Открываем страницу поиска для компании {company.inn} (попытка {attempt+1}/{max_attempts})")
+                self.logger.info(f"Открываем страницу поиска для компании {company.inn} (попытка {attempt+1}/{self.max_retries})")
                 self.driver.get(self.search_url)
                 
+                # Проверка на некорректный URL (data: и др.)
+                if self.driver.current_url.startswith('data.;') or not self.driver.current_url.startswith('http'):
+                    self.logger.error(f"Браузер вернул некорректный URL: {self.driver.current_url}")
+                    if attempt < self.max_retries - 1:
+                        await asyncio.sleep(2)
+                        # Пробуем обновить страницу
+                        try:
+                            self.driver.refresh()
+                            await asyncio.sleep(3)  # Ждем после обновления
+                        except:
+                            pass
+                        continue
+                    else:
+                        # Возвращаем данные с отметкой "не найдено"
+                        company.chairman_name = "не найдено"
+                        company.chairman_inn = "не найдено"
+                        return company
+                
+                # Проверка на блокировку
+                if "вы превысили лимит запросов к серверу" in self.driver.page_source.lower():
+                    self.logger.warning(f"Сайт focus.kontur.ru заблокировал парсер.")
+                    return None
+                
                 # Ждем загрузки поля поиска
-                search_input = self.wait.until(EC.presence_of_element_located((By.XPATH, self.search_input_xpath)))
+                try:
+                    search_input = self.wait.until(EC.presence_of_element_located((By.XPATH, self.search_input_xpath)))
+                except TimeoutException:
+                    self.logger.warning(f"Тайм-аут при ожидании элемента поиска (попытка {attempt+1}/{self.max_retries})")
+                    if attempt < self.max_retries - 1:
+                        await asyncio.sleep(2)
+                        continue
+                    else:
+                        # Возвращаем данные с отметкой "не найдено"
+                        company.chairman_name = "не найдено"
+                        company.chairman_inn = "не найдено"
+                        return company
                 
                 # Вводим ИНН в поле поиска
                 search_input.clear()
@@ -165,7 +208,19 @@ class FocusKonturParser(BaseSiteParser):
                 # Ждем загрузки результатов поиска
                 try:
                     # Ждем появления страницы компании или страницы "ничего не найдено"
-                    self.wait.until(lambda d: 'entity' in d.current_url or 'ничего не найдено' in d.page_source.lower())
+                    self.wait.until(lambda d: 'entity' in d.current_url or 'проверьте запрос на ошибки' in d.page_source.lower() or 'data:' in d.current_url)
+                    
+                    # Проверка на некорректный URL
+                    if self.driver.current_url.startswith('data:'):
+                        self.logger.error(f"Браузер вернул data: URL после поиска")
+                        if attempt < self.max_retries - 1:
+                            await asyncio.sleep(2)
+                            continue
+                        else:
+                            # Возвращаем данные с отметкой "не найдено"
+                            company.chairman_name = "не найдено"
+                            company.chairman_inn = "не найдено"
+                            return company
                     
                     # Даем странице дополнительное время загрузиться (особенно важно для директора)
                     await asyncio.sleep(self.wait_after_search)
@@ -173,7 +228,10 @@ class FocusKonturParser(BaseSiteParser):
                     # Если мы на странице "ничего не найдено"
                     if 'ничего не найдено' in self.driver.page_source.lower():
                         self.logger.warning(f"Компания {company.inn} не найдена на focus.kontur.ru")
-                        return None
+                        # Возвращаем данные с отметкой "не найдено"
+                        company.chairman_name = "не найдено"
+                        company.chairman_inn = "не найдено"
+                        return company
                     
                     # Если мы на странице поиска, но нашли только одну компанию, нажимаем на неё
                     if 'entity' not in self.driver.current_url and 'search' in self.driver.current_url:
@@ -233,44 +291,90 @@ class FocusKonturParser(BaseSiteParser):
                         
                             if not company.chairman_inn:
                                 self.logger.warning(f"ИНН директора не найден для компании {company.inn}")
+                                company.chairman_inn = "не найдено"
                         else:
                             self.logger.warning(f"Информация о директоре не найдена для компании {company.inn}")
+                            company.chairman_name = "не найдено"
+                            company.chairman_inn = "не найдено"
                         
                         return company
                         
                     except StaleElementReferenceException:
-                        if attempt < max_attempts - 1:
-                            self.logger.warning(f"Элемент устарел, повторяем попытку ({attempt+1}/{max_attempts})")
+                        if attempt < self.max_retries - 1:
+                            self.logger.warning(f"Элемент устарел, повторяем попытку ({attempt+1}/{self.max_retries})")
                             await asyncio.sleep(2)
                             continue
                         raise
                     except Exception as e:
                         self.logger.error(f"Ошибка при извлечении данных о компании: {e}")
-                        if attempt < max_attempts - 1:
+                        if attempt < self.max_retries - 1:
                             await asyncio.sleep(2)
                             continue
-                        return None
+                        # Возвращаем данные с отметкой "не найдено"
+                        company.chairman_name = "не найдено"
+                        company.chairman_inn = "не найдено"
+                        return company
                     
                 except TimeoutException:
                     self.logger.warning(f"Тайм-аут при получении данных для компании {company.inn}")
-                    if attempt < max_attempts - 1:
+                    if attempt < self.max_retries - 1:
                         await asyncio.sleep(2)
                         continue
-                    return None
+                    # Возвращаем данные с отметкой "не найдено"
+                    company.chairman_name = "не найдено"
+                    company.chairman_inn = "не найдено"
+                    return company
                     
             except WebDriverException as e:
                 self.logger.error(f"Ошибка веб-драйвера при парсинге компании {company.inn}: {e}")
-                if attempt < max_attempts - 1:
+                if attempt < self.max_retries - 1:
                     await asyncio.sleep(2)
                     continue
-                return None
+                # Возвращаем данные с отметкой "не найдено"
+                company.chairman_name = "не найдено"
+                company.chairman_inn = "не найдено"
+                return company
             except Exception as e:
                 self.logger.error(f"Ошибка при парсинге компании {company.inn}: {e}")
-                if attempt < max_attempts - 1:
+                if attempt < self.max_retries - 1:
                     await asyncio.sleep(2)
                     continue
+                # Возвращаем данные с отметкой "не найдено"
+                company.chairman_name = "не найдено"
+                company.chairman_inn = "не найдено"
+                return company
         
-        return None
+        # Если все попытки не удались
+        company.chairman_name = "не найдено"
+        company.chairman_inn = "не найдено"
+        return company
+
+    def _get_data_manager(self) -> Optional[DataManager]:
+        """Получает ссылку на глобальный data_manager для обновления результатов"""
+        try:
+            # Ищем data_manager в глобальных переменных
+            from parser_base import DataManager
+            data_manager = None
+            
+            # Ищем data_manager в globals()
+            for var_name, var_value in globals().items():
+                if isinstance(var_value, DataManager):
+                    data_manager = var_value
+                    break
+                    
+            # Также ищем в ссылках из модуля main
+            if data_manager is None:
+                try:
+                    import main
+                    if hasattr(main, 'data_manager') and main.data_manager is not None:
+                        data_manager = main.data_manager
+                except:
+                    pass
+            
+            return data_manager
+        except Exception as e:
+            self.logger.error(f"Ошибка при получении data_manager: {e}")
+            return None
 
 class CheckoParser(BaseSiteParser):
     """Парсер для сайта checko.ru"""

@@ -19,39 +19,74 @@ logger = logging.getLogger("TIN_Parser.Main")
 
 # Глобальная переменная для хранения менеджера данных
 data_manager = None
+# Флаг для предотвращения повторного сохранения
+is_saving = False
+# Флаг для обозначения, что программа завершается
+is_exiting = False
 
 # Функция для форсированного сохранения при любом завершении
 @atexit.register
 def save_on_exit():
-    global data_manager
-    if data_manager:
+    global data_manager, is_saving, is_exiting
+    if data_manager and not is_saving and not is_exiting:
         try:
+            is_saving = True
             logger.info("Функция завершения работы - сохраняем результаты")
-            data_manager.save_results(force=True)
+            
+            # Обновляем основной словарь результатов из runtime_results
+            for inn, company in data_manager.runtime_results.items():
+                data_manager.results[inn] = company
+                data_manager.processed_inns.add(inn)
+            
+            # Сначала сохраняем в кэш для гарантии
+            data_manager._save_cache()
+            logger.info(f"Кэш успешно сохранен с {len(data_manager.runtime_results)} новыми записями")
+            
+            # Затем форсированное сохранение в CSV
+            data_manager._save_to_csv()
             logger.info("Результаты успешно сохранены при завершении.")
         except Exception as e:
             logger.error(f"Ошибка при сохранении результатов при завершении: {e}")
+        finally:
+            is_saving = False
 
 def signal_handler(sig, frame):
     """Обработчик сигнала прерывания (Ctrl+C)"""
-    global data_manager
+    global data_manager, is_saving, is_exiting
+    
+    if is_exiting:
+        logger.info("Повторный сигнал прерывания - выходим немедленно")
+        os._exit(1)
+    
+    is_exiting = True
     logger.info("Получен сигнал прерывания. Сохраняем результаты перед выходом...")
     
-    if data_manager:
+    if data_manager and not is_saving:
         try:
-            # Форсированное сохранение результатов
-            data_manager.save_results(force=True)
-            logger.info("Результаты успешно сохранены.")
+            is_saving = True
+            # Обновляем основной словарь результатов из runtime_results
+            for inn, company in data_manager.runtime_results.items():
+                data_manager.results[inn] = company
+                data_manager.processed_inns.add(inn)
+            
+            # Сначала сохраняем в кэш для гарантии
+            data_manager._save_cache()
+            logger.info(f"Кэш успешно сохранен с {len(data_manager.runtime_results)} новыми записями")
+            
+            # Затем форсированное сохранение в CSV
+            data_manager._save_to_csv()
+            logger.info("Результаты успешно сохранены в CSV.")
         except Exception as e:
             logger.error(f"Ошибка при сохранении результатов: {e}")
+        finally:
+            is_saving = False
     
     logger.info("Процесс был прерван пользователем")
-    
     os._exit(0)  # Немедленное завершение без вызова деструкторов (может помочь избежать ошибок при закрытии)
 
 async def main():
     """Основная функция парсера"""
-    global data_manager
+    global data_manager, is_saving, is_exiting
     
     # Настройка обработчика сигналов
     signal.signal(signal.SIGINT, signal_handler)
@@ -94,23 +129,51 @@ async def main():
             logger.info(f"Среднее время на компанию: {total_time/processed_count:.2f} секунд")
     except KeyboardInterrupt:
         # Перехватываем Ctrl+C для корректного завершения
-        if data_manager:
+        if data_manager and not is_saving:
             try:
-                data_manager.save_results(force=True)
+                is_saving = True
+                
+                # Обновляем основной словарь результатов из runtime_results
+                for inn, company in data_manager.runtime_results.items():
+                    data_manager.results[inn] = company
+                    data_manager.processed_inns.add(inn)
+                
+                # Сначала сохраняем в кэш для гарантии
+                data_manager._save_cache()
+                logger.info(f"Кэш успешно сохранен с {len(data_manager.runtime_results)} новыми записями")
+                
+                # Затем форсированное сохранение в CSV
+                data_manager._save_to_csv()
                 logger.info("Результаты сохранены при получении сигнала прерывания")
             except Exception as e:
                 logger.error(f"Ошибка при сохранении результатов: {e}")
+            finally:
+                is_saving = False
         logger.info("Процесс был прерван пользователем")
         return 130
     except Exception as e:
         logger.error(f"Произошла ошибка при выполнении парсера: {e}")
         # Пытаемся сохранить данные даже при ошибке
-        if data_manager:
+        if data_manager and not is_saving:
             try:
-                data_manager.save_results(force=True)
+                is_saving = True
+                
+                # Обновляем основной словарь результатов из runtime_results
+                for inn, company in data_manager.runtime_results.items():
+                    data_manager.results[inn] = company
+                    data_manager.processed_inns.add(inn)
+                
+                # Сначала сохраняем в кэш для гарантии
+                data_manager._save_cache()
+                logger.info(f"Кэш успешно сохранен с {len(data_manager.runtime_results)} новыми записями")
+                
+                # Затем форсированное сохранение в CSV
+                data_manager._save_to_csv()
                 logger.info("Результаты сохранены несмотря на ошибку")
             except Exception as save_error:
                 logger.error(f"Ошибка при сохранении результатов: {save_error}")
+            finally:
+                is_saving = False
         return 1
     
     return 0
@@ -118,10 +181,16 @@ async def main():
 if __name__ == "__main__":
     try:
         exit_code = asyncio.run(main())
+        # Устанавливаем флаг, что программа завершается
+        is_exiting = True
         sys.exit(exit_code)
     except KeyboardInterrupt:
+        # Устанавливаем флаг, что программа завершается
+        is_exiting = True
         logger.info("Процесс был прерван пользователем")
         sys.exit(0)  # Используем код 0 вместо 130
     except Exception as e:
+        # Устанавливаем флаг, что программа завершается
+        is_exiting = True
         logger.error(f"Необработанная ошибка: {e}")
         sys.exit(1) 
