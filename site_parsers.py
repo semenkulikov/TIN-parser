@@ -1012,15 +1012,14 @@ class RbcCompaniesParser(BaseSiteParser):
         return None
 
 class DadataParser(BaseSiteParser):
-    """Парсер для получения информации о компаниях через API dadata.ru и FNS API для получения ИНН руководителя"""
+    """Парсер для получения информации о компаниях через API dadata.ru"""
     
-    def __init__(self, token: str, rate_limit: float = 0.2, fns_keys: List[str] = None):
+    def __init__(self, token: str, rate_limit: float = 0.2):
         """
         Инициализация клиента Dadata
         
         :param token: API ключ для доступа к сервису dadata.ru
         :param rate_limit: Задержка между запросами (по умолчанию 0.2 секунды, до 10000 запросов в день)
-        :param fns_keys: Список API ключей для FNS API
         """
         super().__init__("dadata.ru", rate_limit)
         
@@ -1031,10 +1030,6 @@ class DadataParser(BaseSiteParser):
             
         self.dadata_keys = KeyRotator(dadata_keys, "dadata.ru")
         self.primary_token = token  # Сохраняем первичный токен
-        
-        if not fns_keys:
-            fns_keys = self._load_api_keys_from_env('FNS_TOKEN')
-        self.fns_keys = KeyRotator(fns_keys, "fns-api")
 
         # Настройка Chrome
         self.options = Options()
@@ -1112,7 +1107,7 @@ class DadataParser(BaseSiteParser):
             return None
         
         try:
-            return DadataAsync(token, timeout=60)  # Увеличиваем таймаут до 60 секунд для запроса к API
+            return DadataAsync(token)
         except Exception as e:
             self.logger.error(f"Ошибка при создании клиента Dadata: {e}")
             return None
@@ -1145,7 +1140,7 @@ class DadataParser(BaseSiteParser):
         
         # Создаем новый клиент
         try:
-            return DadataAsync(token, timeout=60)  # Увеличиваем таймаут до 60 секунд для запроса к API
+            return DadataAsync(token)
         except Exception as e:
             self.logger.error(f"Ошибка при создании клиента Dadata с новым ключом: {e}")
             return None
