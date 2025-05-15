@@ -359,6 +359,7 @@ class ParserManager:
         self.parsers: List[BaseSiteParser] = []
         self.logger = logging.getLogger("TIN_Parser.Manager")
         self.batch_size = 50  # Размер пакета компаний для обработки
+        self.max_workers = 3  # Максимальное количество параллельных процессов
     
     def add_parser(self, parser: BaseSiteParser) -> None:
         """Добавление парсера"""
@@ -443,16 +444,52 @@ class ParserManager:
         #     await asyncio.gather(*tasks)
 
         tasks = []
-        with concurrent.futures.ProcessPoolExecutor(max_workers=3) as executor:
+        self.logger.info(f"Запуск обработки с {self.max_workers} параллельными процессами")
+        with concurrent.futures.ProcessPoolExecutor(max_workers=self.max_workers) as executor:
             loop = asyncio.get_event_loop()
-            for parser_class, assigned_companies in parser_companies.items():
+            for parser, assigned_companies in parser_companies.items():
                 if not assigned_companies:
                     continue
 
+                # Получаем все доступные API ключи для Dadata, если парсер - DadataParser
+                dadata_keys = []
+                if parser.__class__.__name__ == "DadataParser" and hasattr(parser, "dadata_keys"):
+                    for i in range(parser.dadata_keys.get_all_keys_count()):
+                        if i == 0:
+                            dadata_keys.append(parser.primary_token)
+                        else:
+                            key = os.getenv(f"DADATA_TOKEN_{i}")
+                            if key:
+                                dadata_keys.append(key)
+                    
+                    self.logger.info(f"Найдено {len(dadata_keys)} API ключей для распределения между пакетами")
+
+                # Разбиваем компании на пакеты
                 batches = [assigned_companies[i:i + self.batch_size] for i in range(0, len(assigned_companies), self.batch_size)]
-                for batch in batches:
-                    task = loop.run_in_executor(executor, self.process_batch_sync, parser_class, batch)
-                    tasks.append(task)
+                
+                # Если у нас DadataParser, создаём отдельный экземпляр для каждого пакета с отдельным ключом
+                if parser.__class__.__name__ == "DadataParser" and dadata_keys:
+                    for batch_idx, batch in enumerate(batches):
+                        # Выбираем ключ для этого пакета (циклически)
+                        key_idx = batch_idx % len(dadata_keys)
+                        api_key = dadata_keys[key_idx]
+                        
+                        # Создаём новый экземпляр парсера для этого пакета с выбранным ключом
+                        from site_parsers import DadataParser
+                        batch_parser = DadataParser(token=api_key, rate_limit=parser.rate_limit)
+                        # Принудительно устанавливаем ключ для этого экземпляра
+                        batch_parser.set_specific_token(api_key)
+                        
+                        self.logger.info(f"Пакет {batch_idx+1} будет использовать ключ {key_idx+1}/{len(dadata_keys)}")
+                        
+                        # Добавляем задачу с новым экземпляром парсера
+                        task = loop.run_in_executor(executor, self.process_batch_sync, batch_parser, batch)
+                        tasks.append(task)
+                else:
+                    # Для других типов парсеров обрабатываем как обычно
+                    for batch in batches:
+                        task = loop.run_in_executor(executor, self.process_batch_sync, parser, batch)
+                        tasks.append(task)
 
             if tasks:
                 await asyncio.gather(*tasks)

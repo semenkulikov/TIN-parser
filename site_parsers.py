@@ -1030,6 +1030,7 @@ class DadataParser(BaseSiteParser):
             dadata_keys.insert(0, token)
             
         self.dadata_keys = KeyRotator(dadata_keys, "dadata.ru")
+        self.primary_token = token  # Сохраняем первичный токен
         
         if not fns_keys:
             fns_keys = self._load_api_keys_from_env('FNS_TOKEN')
@@ -1048,6 +1049,25 @@ class DadataParser(BaseSiteParser):
         self.dadata = None  # Инициализируется в parse_companies
         self.failed_key_attempts = {}  # Словарь для отслеживания неудачных попыток по ключам
         self.max_key_attempts = 3  # Максимальное количество неудачных попыток для ключа
+        self.force_token = None  # Токен, который будет использоваться принудительно в этом экземпляре
+        self.ignore_force_token_temporarily = False  # Флаг для временного игнорирования принудительного токена
+    
+    def set_specific_token(self, token: str) -> None:
+        """
+        Устанавливает конкретный токен для использования в этом экземпляре
+        
+        :param token: API ключ для использования
+        """
+        self.force_token = token
+        self.ignore_force_token_temporarily = False  # Сбрасываем флаг при установке нового токена
+        self.logger.info(f"Установлен принудительный токен для этого экземпляра парсера")
+    
+    def _temporarily_ignore_force_token(self) -> None:
+        """
+        Временно игнорирует принудительно установленный токен из-за ошибки
+        """
+        self.ignore_force_token_temporarily = True
+        self.logger.warning(f"Временно игнорируем принудительно установленный токен из-за ошибки")
     
     def _load_api_keys_from_env(self, env_prefix: str) -> List[str]:
         """
@@ -1080,13 +1100,19 @@ class DadataParser(BaseSiteParser):
         
         :return: DadataAsync клиент или None в случае ошибки
         """
-        token = self.dadata_keys.get_current_key()
+        # Если установлен принудительный токен и не нужно его игнорировать, используем его
+        if self.force_token and not self.ignore_force_token_temporarily:
+            token = self.force_token
+            self.logger.info(f"Используется принудительно установленный токен")
+        else:
+            token = self.dadata_keys.get_current_key()
+            
         if not token:
             self.logger.error("Нет доступных API ключей Dadata")
             return None
         
         try:
-            return DadataAsync(token, timeout=60)
+            return DadataAsync(token, timeout=60)  # Увеличиваем таймаут до 60 секунд для запроса к API
         except Exception as e:
             self.logger.error(f"Ошибка при создании клиента Dadata: {e}")
             return None
@@ -1105,15 +1131,21 @@ class DadataParser(BaseSiteParser):
                 pass
             self.dadata = None
         
-        # Переключаемся на следующий ключ
-        token = self.dadata_keys.rotate_key()
+        # Если установлен принудительный токен и не нужно его игнорировать, всегда используем его
+        if self.force_token and not self.ignore_force_token_temporarily:
+            token = self.force_token
+            self.logger.info(f"Продолжаем использовать принудительно установленный токен")
+        else:
+            # Переключаемся на следующий ключ
+            token = self.dadata_keys.rotate_key()
+            
         if not token:
             self.logger.error("Нет доступных API ключей Dadata для ротации")
             return None
         
         # Создаем новый клиент
         try:
-            return DadataAsync(token, timeout=60)
+            return DadataAsync(token, timeout=60)  # Увеличиваем таймаут до 60 секунд для запроса к API
         except Exception as e:
             self.logger.error(f"Ошибка при создании клиента Dadata с новым ключом: {e}")
             return None
@@ -1277,6 +1309,9 @@ class DadataParser(BaseSiteParser):
                 if current_key in self.failed_key_attempts:
                     del self.failed_key_attempts[current_key]
                 
+                # Сбрасываем флаг игнорирования принудительного токена, так как запрос успешен
+                self.ignore_force_token_temporarily = False
+                
                 return company
                 
             except Exception as e:
@@ -1300,6 +1335,10 @@ class DadataParser(BaseSiteParser):
                         if self.failed_key_attempts.get(current_key, 0) >= self.max_key_attempts:
                             self.logger.warning(f"Ключ многократно вызывал ошибку авторизации, пробуем другой ключ")
                             
+                            # Если был установлен принудительный токен и он не работает, временно игнорируем его
+                            if self.force_token and current_key == self.force_token:
+                                self._temporarily_ignore_force_token()
+                            
                             # Закрываем текущий клиент и пробуем создать новый с другим ключом
                             if self.dadata:
                                 try:
@@ -1312,6 +1351,10 @@ class DadataParser(BaseSiteParser):
                     # Если ошибка связана с превышением лимита запросов (429 Too Many Requests)
                     elif e.response.status_code == 429:
                         self.logger.warning(f"Превышен лимит запросов для API-ключа Dadata, переключаемся на другой ключ")
+                        
+                        # Если был установлен принудительный токен и он превысил лимит, временно игнорируем его
+                        if self.force_token and current_key == self.force_token:
+                            self._temporarily_ignore_force_token()
                         
                         # Закрываем текущий клиент и пробуем создать новый с другим ключом
                         if self.dadata:

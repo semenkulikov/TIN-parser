@@ -147,6 +147,11 @@ async def main():
         # Загружаем ключи для Dadata (FNS больше не используется, т.к. ИНН получаем через сайт)
         dadata_keys = load_api_keys('DADATA_TOKEN')
         
+        # Настраиваем максимальное количество параллельных процессов в зависимости от числа ключей
+        max_workers = min(len(dadata_keys), 5) if dadata_keys else 1
+        parser_manager.max_workers = max_workers
+        logger.info(f"Установлено максимальное количество параллельных процессов: {max_workers}")
+        
         # Добавляем парсер только если есть хотя бы один ключ Dadata
         if dadata_keys:
             # Используем только первый ключ из списка для передачи в конструктор
