@@ -11,8 +11,12 @@ from site_parsers import (
     CheckoParser,
     ZaChestnyiBiznesParser,
     AuditItParser,
-    RbcCompaniesParser
+    RbcCompaniesParser,
+    DadataParser
 )
+from dotenv import load_dotenv
+
+load_dotenv()
 
 # Настройка логирования
 logger = logging.getLogger("TIN_Parser.Main")
@@ -23,6 +27,12 @@ data_manager = None
 is_saving = False
 # Флаг для обозначения, что программа завершается
 is_exiting = False
+
+# Получение токена Dadata из переменных окружения или установка пустого значения для демонстрации
+# В реальном использовании установите переменную окружения DADATA_TOKEN с вашим API-ключом
+# export DADATA_TOKEN=ваш_токен
+# Для демонстрации можно заменить на реальный токен, например:
+# os.environ['DADATA_TOKEN'] = 'ваш_токен_dadata'
 
 # Функция для форсированного сохранения при любом завершении
 @atexit.register
@@ -110,7 +120,18 @@ async def main():
         parser_manager = ParserManager(data_manager)
         
         # Добавление парсеров для каждого сайта
-        parser_manager.add_parser(FocusKonturParser(rate_limit=5.0))
+        # Добавляем парсер для Dadata (токен должен быть получен при регистрации на сайте dadata.ru)
+        # ВАЖНО: Для корректной работы необходимо указать полный действительный токен
+        # Текущий токен неполный и приводит к ошибке 403 Forbidden
+        # Получите действительный токен на сайте https://dadata.ru/profile/#info
+        dadata_token = os.getenv('DADATA_TOKEN')
+        if dadata_token:
+            parser_manager.add_parser(DadataParser(token=dadata_token, rate_limit=0.2))
+        else:
+            logger.warning("Переменная окружения DADATA_TOKEN не задана, парсер Dadata не будет использоваться")
+            
+        # Добавляем стандартные парсеры
+        # parser_manager.add_parser(FocusKonturParser(rate_limit=5.0))
         # parser_manager.add_parser(CheckoParser(rate_limit=2.0))
         # parser_manager.add_parser(ZaChestnyiBiznesParser(rate_limit=3.0))
         # parser_manager.add_parser(AuditItParser(rate_limit=2.0))

@@ -16,7 +16,8 @@ from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
 from selenium.common.exceptions import TimeoutException, NoSuchElementException, WebDriverException, StaleElementReferenceException
 from parser_base import BaseSiteParser, CompanyData, DataManager
-import undetected_chromedriver as uc
+# import undetected_chromedriver as uc
+from dadata import Dadata, DadataAsync
 
 class FocusKonturParser(BaseSiteParser):
     """Парсер для сайта focus.kontur.ru"""
@@ -562,7 +563,7 @@ class AuditItParser(BaseSiteParser):
         self.search_url = "https://www.audit-it.ru/contragent"
 
         # Настройка Chrome
-        # self.options = Options()
+        self.options = Options()
         # # self.options.add_argument('--headless')  # Запуск в фоновом режиме
         # self.options.add_argument('--no-sandbox')
         # self.options.add_argument('--disable-dev-shm-usage')
@@ -571,7 +572,7 @@ class AuditItParser(BaseSiteParser):
         # self.options.add_argument('--ignore-ssl-errors')
         # self.options.add_argument('--log-level=3')  # Уменьшаем вывод логов браузера
 
-        self.options = uc.ChromeOptions()
+        # self.options = uc.ChromeOptions()
         self.options.add_argument("--no-sandbox")
         self.options.add_argument("--disable-blink-features=AutomationControlled")
         self.options.add_argument("--disable-extensions")
@@ -614,7 +615,7 @@ class AuditItParser(BaseSiteParser):
             
             # Создаем сервис и драйвер
             service = Service(executable_path=chromedriver_path)
-            self.driver = uc.Chrome(service=service, options=self.options)
+            self.driver = webdriver.Chrome(service=service, options=self.options)
             self.driver.set_page_load_timeout(self.page_load_timeout)
             self.wait = WebDriverWait(self.driver, self.wait_timeout)
             
@@ -947,4 +948,154 @@ class RbcCompaniesParser(BaseSiteParser):
                     await asyncio.sleep(2)
                     continue
         
+        return None
+
+class DadataParser(BaseSiteParser):
+    """Парсер для получения информации о компаниях через API dadata.ru"""
+    
+    def __init__(self, token: str, rate_limit: float = 0.2):
+        """
+        Инициализация клиента Dadata
+        
+        :param token: API ключ для доступа к сервису dadata.ru
+        :param rate_limit: Задержка между запросами (по умолчанию 0.2 секунды, до 10000 запросов в день)
+        """
+        super().__init__("dadata.ru", rate_limit)
+        self.token = token
+        self.dadata = None  # Инициализируется в parse_companies
+    
+    async def parse_companies(self, companies: List[CompanyData]) -> List[CompanyData]:
+        """Парсит список компаний через API dadata.ru"""
+        results = []
+        self.logger.info(f"Начинаем обработку {len(companies)} компаний через API Dadata")
+        
+        try:
+            # Инициализация асинхронного клиента Dadata
+            async with DadataAsync(self.token) as self.dadata:
+                # Получаем ссылку на data_manager для обновления результатов
+                data_manager = self._get_data_manager()
+                
+                # Обработка всех компаний
+                for i, company in enumerate(companies):
+                    try:
+                        # Проверяем на прерывание программы перед каждой компанией
+                        try:
+                            # Используем asyncio.sleep с очень маленьким таймаутом для проверки прерываний
+                            await asyncio.sleep(0.01)
+                        except asyncio.CancelledError:
+                            self.logger.info("Обнаружено прерывание, останавливаем парсинг")
+                            break
+                        
+                        self.logger.info(f"[{i+1}/{len(companies)}] Обработка компании: {company.name} (ИНН: {company.inn})")
+                        
+                        # Соблюдаем задержку между запросами
+                        await asyncio.sleep(self.rate_limit)
+                        
+                        # Парсим информацию о компании
+                        result = await self.parse_company(company)
+                        if result:
+                            result.source = self.site_name
+                            results.append(result)
+                            self.logger.info(f"Успешно получены данные для {company.name}")
+                            
+                            # Обновляем результаты в data_manager если он доступен
+                            if data_manager:
+                                data_manager.update_results(result)
+                        else:
+                            self.logger.warning(f"Не удалось получить данные для {company.name}")
+                            
+                    except Exception as e:
+                        self.logger.error(f"Ошибка при обработке компании {company.name}: {e}")
+                
+                self.logger.info(f"Завершена обработка компаний через API Dadata, успешно: {len(results)} из {len(companies)}")
+            
+        except Exception as e:
+            self.logger.error(f"Ошибка при инициализации API Dadata: {e}")
+        finally:
+            self.dadata = None
+        
+        return results
+    
+    async def parse_company(self, company: CompanyData) -> Optional[CompanyData]:
+        """
+        Получает информацию о руководителе компании через API dadata.ru
+        
+        :param company: Объект с данными о компании
+        :return: Обновленный объект с данными о компании или None в случае ошибки
+        """
+        if not self.dadata:
+            self.logger.error("Клиент Dadata не инициализирован")
+            return None
+        
+        try:
+            # Поиск компании по ИНН
+            organizations = await self.dadata.find_by_id(name="party", query=company.inn)
+            
+            if not organizations:
+                self.logger.warning(f"Компания с ИНН {company.inn} не найдена в dadata.ru")
+                # Возвращаем данные с отметкой "не найдено"
+                company.chairman_name = "не найдено"
+                company.chairman_inn = "не найдено"
+                return company
+            
+            # Берем первую найденную организацию (обычно самую релевантную)
+            org_data = organizations[0]['data']
+            
+            # Проверяем наличие данных о руководителе
+            if org_data.get('management') and org_data['management'].get('name'):
+                # Извлекаем имя руководителя
+                company.chairman_name = org_data['management']['name']
+                self.logger.info(f"Найден руководитель: {company.chairman_name}")
+                
+                # ИНН руководителя не доступен в бесплатном API, но мы можем попытаться найти 
+                # его в списке managers, если он там есть
+                if org_data.get('managers') and len(org_data['managers']) > 0:
+                    for manager in org_data['managers']:
+                        if manager.get('post') and ('председатель' in manager['post'].lower() or 'директор' in manager['post'].lower() or 'руководитель' in manager['post'].lower()):
+                            if manager.get('inn'):
+                                company.chairman_inn = manager['inn']
+                                self.logger.info(f"Найден ИНН руководителя: {company.chairman_inn}")
+                                break
+                
+                # Если не нашли ИНН руководителя, ставим соответствующую отметку
+                if not company.chairman_inn:
+                    company.chairman_inn = "не найдено через API"
+            else:
+                # Информация о руководителе не найдена
+                company.chairman_name = "не найдено"
+                company.chairman_inn = "не найдено"
+                self.logger.warning(f"Данные о руководителе компании {company.name} не найдены в dadata.ru")
+                
+            return company
+            
+        except Exception as e:
+            import httpx
+            # Проверяем, является ли ошибка ошибкой авторизации (403 Forbidden)
+            if isinstance(e, httpx.HTTPStatusError) and e.response.status_code == 403:
+                self.logger.error(
+                    f"Ошибка при получении данных из API dadata.ru: ошибка авторизации (403 Forbidden). "
+                    f"Проверьте правильность API-ключа. Получите действительный токен на сайте https://dadata.ru/profile/#info"
+                )
+            else:
+                self.logger.error(f"Ошибка при получении данных из API dadata.ru: {e}")
+            return None
+    
+    def _get_data_manager(self) -> Optional[DataManager]:
+        """
+        Получает объект DataManager из текущего экземпляра BaseSiteParser
+        через поиск в родительских объектах
+        
+        :return: Экземпляр DataManager или None
+        """
+        try:
+            # Получаем доступ к родительскому объекту ParserManager
+            frame = sys._getframe(2)
+            while frame:
+                if 'self' in frame.f_locals:
+                    parser_manager = frame.f_locals['self']
+                    if hasattr(parser_manager, 'data_manager'):
+                        return parser_manager.data_manager
+                frame = frame.f_back
+        except Exception as e:
+            self.logger.debug(f"Не удалось получить доступ к data_manager: {e}")
         return None 
