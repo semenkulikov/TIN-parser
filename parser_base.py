@@ -316,7 +316,7 @@ class ParserManager:
         self.data_manager = data_manager
         self.parsers: List[BaseSiteParser] = []
         self.logger = logging.getLogger("TIN_Parser.Manager")
-        self.batch_size = 20  # Размер пакета компаний для обработки
+        self.batch_size = 50  # Размер пакета компаний для обработки
     
     def add_parser(self, parser: BaseSiteParser) -> None:
         """Добавление парсера"""

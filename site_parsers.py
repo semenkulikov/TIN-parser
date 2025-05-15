@@ -1034,6 +1034,16 @@ class DadataParser(BaseSiteParser):
         if not fns_keys:
             fns_keys = self._load_api_keys_from_env('FNS_TOKEN')
         self.fns_keys = KeyRotator(fns_keys, "fns-api")
+
+        # Настройка Chrome
+        self.options = Options()
+        self.options.add_argument('--headless')  # Запуск в фоновом режиме
+        self.options.add_argument('--no-sandbox')
+        self.options.add_argument('--disable-dev-shm-usage')
+        self.options.add_argument('--ignore-certificate-errors')
+        self.options.add_argument('--ignore-ssl-errors')
+        self.options.add_argument('--log-level=3')  # Уменьшаем вывод логов браузера
+            
         
         self.dadata = None  # Инициализируется в parse_companies
         self.failed_key_attempts = {}  # Словарь для отслеживания неудачных попыток по ключам
@@ -1117,6 +1127,21 @@ class DadataParser(BaseSiteParser):
         self.failed_key_attempts = {}
         
         try:
+
+            # Инициализация браузера
+            chromedriver_path = os.path.join(os.getcwd(), 'chromedriver.exe')
+            if not os.path.exists(chromedriver_path):
+                chromedriver_path = 'C:/chromedriver/chromedriver.exe'
+                if not os.path.exists(chromedriver_path):
+                    self.logger.error(f"ChromeDriver не найден по указанным путям")
+                    return None
+            
+            # Создаем сервис и драйвер
+            service = Service(executable_path=chromedriver_path)
+            self.driver = webdriver.Chrome(service=service, options=self.options)
+            self.driver.set_page_load_timeout(60)  # Таймаут загрузки страницы (секунды)
+            self.wait = WebDriverWait(self.driver, 10)  # Таймаут для ожидания элементов (секунды)
+            
             # Получаем ссылку на data_manager для обновления результатов
             data_manager = self._get_data_manager()
             
@@ -1164,6 +1189,14 @@ class DadataParser(BaseSiteParser):
                 except:
                     pass
             self.dadata = None
+            # Закрываем браузер только один раз после обработки всех компаний
+            if self.driver:
+                try:
+                    self.driver.quit()
+                except Exception as e:
+                    self.logger.error(f"Ошибка при закрытии браузера: {e}")
+                self.driver = None
+                self.wait = None
         
         return results
     
@@ -1190,7 +1223,7 @@ class DadataParser(BaseSiteParser):
                 organizations = await self.dadata.find_by_id(name="party", query=company.inn)
                 
                 if not organizations:
-                    self.logger.warning(f"Компания с ИНН {company.inn} не найдена в dadata.ru")
+                    self.logger.warning(f"Компания {company.name} с ИНН {company.inn} не найдена в dadata.ru")
                     # Возвращаем данные с отметкой "не найдено"
                     company.chairman_name = "не найдено"
                     company.chairman_inn = "не найдено"
@@ -1219,6 +1252,11 @@ class DadataParser(BaseSiteParser):
                     
                     # Если ИНН не найден в Dadata, пытаемся получить его через сайт Райффайзен банка
                     if not chairman_inn:
+                        try:
+                            address = org_data.get('address').get("value")
+                            cur_city = address.split(",")[0]
+                        except Exception:
+                            pass
                         chairman_inn = await self._get_chairman_inn_via_raiffeisen(chairman_name)
                         
                         if chairman_inn:
@@ -1305,53 +1343,30 @@ class DadataParser(BaseSiteParser):
         self.logger.info(f"Поиск ИНН для {full_name} через сайт Райффайзен банка")
         
         try:
-            # Инициализация браузера
-            chromedriver_path = os.path.join(os.getcwd(), 'chromedriver.exe')
-            if not os.path.exists(chromedriver_path):
-                chromedriver_path = 'C:/chromedriver/chromedriver.exe'
-                if not os.path.exists(chromedriver_path):
-                    self.logger.error(f"ChromeDriver не найден по указанным путям")
-                    return None
-            
-            # Настройка Chrome
-            options = Options()
-            options.add_argument('--headless')  # Запуск в фоновом режиме
-            options.add_argument('--no-sandbox')
-            options.add_argument('--disable-dev-shm-usage')
-            options.add_argument('--ignore-certificate-errors')
-            options.add_argument('--ignore-ssl-errors')
-            options.add_argument('--log-level=3')  # Уменьшаем вывод логов браузера
-            
-            # Создаем сервис и драйвер
-            service = Service(executable_path=chromedriver_path)
-            driver = webdriver.Chrome(service=service, options=options)
-            driver.set_page_load_timeout(60)  # Таймаут загрузки страницы (секунды)
-            wait = WebDriverWait(driver, 10)  # Таймаут для ожидания элементов (секунды)
-            
             try:
                 # Загрузка страницы
                 self.logger.info("Открываем сайт reg-raiffeisen.ru")
-                driver.get("https://reg-raiffeisen.ru/")
+                self.driver.get("https://reg-raiffeisen.ru/")
                 
                 # Прокручиваем страницу вниз
-                driver.execute_script("window.scrollTo(0, document.body.scrollHeight);")
+                self.driver.execute_script("window.scrollTo(0, document.body.scrollHeight);")
                 
                 # Находим поле ввода для поиска ИП или ООО
                 try:
                     # Попытка найти поле ввода по XPath
                     xpath = "/html/body/div[1]/div[3]/div/div[2]/div[14]/div[2]/div/div/div/div/form/div[1]/div[1]/div/div/div[1]/div/div/div/div[1]/div[1]/input"
-                    input_field = wait.until(EC.presence_of_element_located((By.XPATH, xpath)))
+                    input_field = self.wait.until(EC.presence_of_element_located((By.XPATH, xpath)))
                 except Exception:
                     # Если XPath не сработал, пробуем найти по ID или другим атрибутам
                     self.logger.info("Поиск поля ввода по ID или атрибутам")
                     try:
-                        input_field = wait.until(EC.presence_of_element_located((By.ID, "party")))
+                        input_field = self.wait.until(EC.presence_of_element_located((By.ID, "party")))
                     except Exception:
                         # Последняя попытка - найти по названию
-                        input_field = wait.until(EC.presence_of_element_located((By.NAME, "party")))
+                        input_field = self.wait.until(EC.presence_of_element_located((By.NAME, "party")))
                 
                 # Прокручиваем страницу к полю ввода
-                driver.execute_script("arguments[0].scrollIntoView({block: 'center'});", input_field)
+                self.driver.execute_script("arguments[0].scrollIntoView({block: 'center'});", input_field)
                 
                 # Делаем паузу перед вводом
                 await asyncio.sleep(1)
@@ -1362,7 +1377,7 @@ class DadataParser(BaseSiteParser):
                 
                 # Ждем появления выпадающего списка с подсказками
                 self.logger.info(f"Ожидаем результаты автоподсказки для {full_name}")
-                autocomplete_list = wait.until(EC.presence_of_element_located((By.CLASS_NAME, "autocomplete-list")))
+                autocomplete_list = self.wait.until(EC.presence_of_element_located((By.CLASS_NAME, "autocomplete-list")))
                 
                 # Ждем небольшую паузу для полной загрузки списка
                 await asyncio.sleep(2)
@@ -1395,12 +1410,6 @@ class DadataParser(BaseSiteParser):
             except Exception as e:
                 self.logger.error(f"Ошибка при парсинге сайта Райффайзен: {e}")
                 return None
-            finally:
-                # Закрываем браузер в любом случае
-                try:
-                    driver.quit()
-                except Exception as e:
-                    self.logger.error(f"Ошибка при закрытии браузера: {e}")
         
         except Exception as e:
             self.logger.error(f"Ошибка при инициализации браузера: {e}")
