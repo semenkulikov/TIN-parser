@@ -64,6 +64,7 @@ class DataManager:
         self.save_results_counter = 0
         self.runtime_results: Dict[str, CompanyData] = {}  # Результаты текущего запуска
         self._load_cache()
+        self._load_csv_results()  # Загружаем результаты из CSV
     
     def read_input_data(self) -> pd.DataFrame:
         """Чтение исходных данных из Excel-файла"""
@@ -76,27 +77,68 @@ class DataManager:
             logger.error(f"Ошибка при чтении файла {self.input_file}: {e}")
             raise
     
+    def _load_csv_results(self) -> None:
+        """Загрузка результатов из CSV файла"""
+        if os.path.exists(self.output_file) and os.path.getsize(self.output_file) > 0:
+            try:
+                df = pd.read_csv(self.output_file, encoding='utf-8')
+                loaded_count = 0
+                
+                for _, row in df.iterrows():
+                    inn = str(row['ИНН'])
+                    
+                    # Пропускаем, если ИНН уже в результатах или если нет данных о председателе
+                    if inn in self.results:
+                        continue
+                    
+                    chairman_name = row.get('ФИО Председателя')
+                    chairman_inn = row.get('ИНН Председателя')
+                    
+                    # Только если есть данные о председателе, добавляем в список обработанных
+                    if not pd.isna(chairman_name) and not pd.isna(chairman_inn):
+                        company = CompanyData(row['Юридическое название'], inn)
+                        company.chairman_name = chairman_name
+                        company.chairman_inn = chairman_inn
+                        company.source = row.get('Источник')
+                        
+                        self.results[inn] = company
+                        self.processed_inns.add(inn)
+                        loaded_count += 1
+                
+                logger.info(f"Загружено {loaded_count} записей из CSV файла {self.output_file}")
+            except Exception as e:
+                logger.error(f"Ошибка при загрузке данных из CSV: {e}")
+    
     def get_companies_to_process(self) -> List[CompanyData]:
         """Получение списка компаний для обработки (исключая уже обработанные)"""
         df = self.read_input_data()
         companies = []
         
+        # Подсчет статистики для логирования
+        total_records = len(df)
+        already_processed = 0
+        has_data = 0
+        
         for _, row in df.iterrows():
             inn = str(row['ИНН'])
+            
             # Проверяем, был ли уже обработан данный ИНН
             if inn in self.processed_inns:
                 logger.debug(f"Пропуск {inn}, уже обработан")
+                already_processed += 1
                 continue
             
             # Если у нас уже есть данные о председателе, тоже пропускаем
             if not pd.isna(row.get('ФИО Председателя', pd.NA)) and not pd.isna(row.get('ИНН Председателя', pd.NA)):
                 logger.debug(f"Пропуск {inn}, данные уже заполнены")
                 self.processed_inns.add(inn)
+                has_data += 1
                 continue
                 
             company = CompanyData(row['Юридическое название'], inn)
             companies.append(company)
         
+        logger.info(f"Всего записей: {total_records}, уже обработано: {already_processed}, имеют данные: {has_data}")
         logger.info(f"Подготовлено {len(companies)} компаний для обработки")
         return companies
     
