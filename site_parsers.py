@@ -3,10 +3,13 @@ import asyncio
 import logging
 from bs4 import BeautifulSoup
 import re
-from typing import Optional, Dict, Any, List
+from typing import Optional, Dict, Any, List, Tuple
 import os
 import signal
 import sys
+import json
+import time
+from datetime import datetime
 from selenium import webdriver
 from selenium.webdriver.chrome.options import Options
 from selenium.webdriver.chrome.service import Service
@@ -18,6 +21,64 @@ from selenium.common.exceptions import TimeoutException, NoSuchElementException,
 from parser_base import BaseSiteParser, CompanyData, DataManager
 # import undetected_chromedriver as uc
 from dadata import Dadata, DadataAsync
+
+class KeyRotator:
+    """Класс для ротации API ключей"""
+    
+    def __init__(self, keys: List[str], source_name: str):
+        """
+        Инициализация менеджера ротации ключей
+        
+        :param keys: Список API ключей
+        :param source_name: Название источника для логирования
+        """
+        self.keys = keys
+        self.current_index = 0
+        self.logger = logging.getLogger(f"TIN_Parser.{source_name}.KeyRotator")
+        if not keys:
+            self.logger.error("Список ключей пуст!")
+        else:
+            self.logger.info(f"Инициализирован ротатор ключей с {len(keys)} ключами")
+    
+    def get_current_key(self) -> Optional[str]:
+        """
+        Получить текущий активный ключ
+        
+        :return: Текущий ключ или None, если список пуст
+        """
+        if not self.keys:
+            return None
+        return self.keys[self.current_index]
+    
+    def rotate_key(self) -> Optional[str]:
+        """
+        Переключиться на следующий ключ
+        
+        :return: Следующий ключ или None, если список пуст
+        """
+        if not self.keys:
+            return None
+            
+        self.current_index = (self.current_index + 1) % len(self.keys)
+        key = self.keys[self.current_index]
+        self.logger.info(f"Переключение на ключ {self.current_index + 1}/{len(self.keys)}")
+        return key
+    
+    def is_empty(self) -> bool:
+        """
+        Проверить, пуст ли список ключей
+        
+        :return: True, если список пуст, иначе False
+        """
+        return len(self.keys) == 0
+    
+    def get_all_keys_count(self) -> int:
+        """
+        Получить общее количество доступных ключей
+        
+        :return: Количество ключей
+        """
+        return len(self.keys)
 
 class FocusKonturParser(BaseSiteParser):
     """Парсер для сайта focus.kontur.ru"""
@@ -951,133 +1012,398 @@ class RbcCompaniesParser(BaseSiteParser):
         return None
 
 class DadataParser(BaseSiteParser):
-    """Парсер для получения информации о компаниях через API dadata.ru"""
+    """Парсер для получения информации о компаниях через API dadata.ru и FNS API для получения ИНН руководителя"""
     
-    def __init__(self, token: str, rate_limit: float = 0.2):
+    def __init__(self, token: str, rate_limit: float = 0.2, fns_keys: List[str] = None):
         """
         Инициализация клиента Dadata
         
         :param token: API ключ для доступа к сервису dadata.ru
         :param rate_limit: Задержка между запросами (по умолчанию 0.2 секунды, до 10000 запросов в день)
+        :param fns_keys: Список API ключей для FNS API
         """
         super().__init__("dadata.ru", rate_limit)
-        self.token = token
+        
+        # Инициализация ротаторов ключей
+        dadata_keys = self._load_api_keys_from_env('DADATA_TOKEN')
+        if token and token not in dadata_keys:
+            dadata_keys.insert(0, token)
+            
+        self.dadata_keys = KeyRotator(dadata_keys, "dadata.ru")
+        
+        if not fns_keys:
+            fns_keys = self._load_api_keys_from_env('FNS_TOKEN')
+        self.fns_keys = KeyRotator(fns_keys, "fns-api")
+        
         self.dadata = None  # Инициализируется в parse_companies
+        self.failed_key_attempts = {}  # Словарь для отслеживания неудачных попыток по ключам
+        self.max_key_attempts = 3  # Максимальное количество неудачных попыток для ключа
+    
+    def _load_api_keys_from_env(self, env_prefix: str) -> List[str]:
+        """
+        Загружает API ключи из переменных окружения с указанным префиксом
+        
+        :param env_prefix: Префикс для переменных окружения (например, 'DADATA_TOKEN')
+        :return: Список найденных ключей
+        """
+        keys = []
+        # Ищем основной ключ
+        main_key = os.getenv(env_prefix)
+        if main_key:
+            keys.append(main_key)
+        
+        # Ищем дополнительные ключи с номерами (DADATA_TOKEN_1, DADATA_TOKEN_2, и т.д.)
+        i = 1
+        while True:
+            key = os.getenv(f"{env_prefix}_{i}")
+            if not key:
+                break
+            keys.append(key)
+            i += 1
+        
+        self.logger.info(f"Загружено {len(keys)} ключей с префиксом {env_prefix}")
+        return keys
+    
+    async def _create_dadata_client(self) -> Optional[DadataAsync]:
+        """
+        Создает новый клиент Dadata с текущим активным ключом
+        
+        :return: DadataAsync клиент или None в случае ошибки
+        """
+        token = self.dadata_keys.get_current_key()
+        if not token:
+            self.logger.error("Нет доступных API ключей Dadata")
+            return None
+        
+        try:
+            return DadataAsync(token)
+        except Exception as e:
+            self.logger.error(f"Ошибка при создании клиента Dadata: {e}")
+            return None
+            
+    async def _rotate_dadata_client(self) -> Optional[DadataAsync]:
+        """
+        Переключает на следующий API ключ и создает новый клиент
+        
+        :return: Новый DadataAsync клиент или None в случае ошибки
+        """
+        # Закрываем текущий клиент, если он существует
+        if self.dadata:
+            try:
+                await self.dadata.close()
+            except:
+                pass
+            self.dadata = None
+        
+        # Переключаемся на следующий ключ
+        token = self.dadata_keys.rotate_key()
+        if not token:
+            self.logger.error("Нет доступных API ключей Dadata для ротации")
+            return None
+        
+        # Создаем новый клиент
+        try:
+            return DadataAsync(token)
+        except Exception as e:
+            self.logger.error(f"Ошибка при создании клиента Dadata с новым ключом: {e}")
+            return None
     
     async def parse_companies(self, companies: List[CompanyData]) -> List[CompanyData]:
         """Парсит список компаний через API dadata.ru"""
         results = []
         self.logger.info(f"Начинаем обработку {len(companies)} компаний через API Dadata")
         
+        # Сбрасываем счетчик неудачных попыток для ключей
+        self.failed_key_attempts = {}
+        
         try:
-            # Инициализация асинхронного клиента Dadata
-            async with DadataAsync(self.token) as self.dadata:
-                # Получаем ссылку на data_manager для обновления результатов
-                data_manager = self._get_data_manager()
-                
-                # Обработка всех компаний
-                for i, company in enumerate(companies):
+            # Получаем ссылку на data_manager для обновления результатов
+            data_manager = self._get_data_manager()
+            
+            # Обработка всех компаний
+            for i, company in enumerate(companies):
+                try:
+                    # Проверяем на прерывание программы перед каждой компанией
                     try:
-                        # Проверяем на прерывание программы перед каждой компанией
-                        try:
-                            # Используем asyncio.sleep с очень маленьким таймаутом для проверки прерываний
-                            await asyncio.sleep(0.01)
-                        except asyncio.CancelledError:
-                            self.logger.info("Обнаружено прерывание, останавливаем парсинг")
-                            break
+                        # Используем asyncio.sleep с очень маленьким таймаутом для проверки прерываний
+                        await asyncio.sleep(0.01)
+                    except asyncio.CancelledError:
+                        self.logger.info("Обнаружено прерывание, останавливаем парсинг")
+                        break
+                    
+                    self.logger.info(f"[{i+1}/{len(companies)}] Обработка компании: {company.name} (ИНН: {company.inn})")
+                    
+                    # Соблюдаем задержку между запросами
+                    await asyncio.sleep(self.rate_limit)
+                    
+                    # Парсим информацию о компании
+                    result = await self.parse_company(company)
+                    if result:
+                        result.source = self.site_name
+                        results.append(result)
+                        self.logger.info(f"Успешно получены данные для {company.name}")
                         
-                        self.logger.info(f"[{i+1}/{len(companies)}] Обработка компании: {company.name} (ИНН: {company.inn})")
+                        # Обновляем результаты в data_manager если он доступен
+                        if data_manager:
+                            data_manager.update_results(result)
+                    else:
+                        self.logger.warning(f"Не удалось получить данные для {company.name}")
                         
-                        # Соблюдаем задержку между запросами
-                        await asyncio.sleep(self.rate_limit)
-                        
-                        # Парсим информацию о компании
-                        result = await self.parse_company(company)
-                        if result:
-                            result.source = self.site_name
-                            results.append(result)
-                            self.logger.info(f"Успешно получены данные для {company.name}")
-                            
-                            # Обновляем результаты в data_manager если он доступен
-                            if data_manager:
-                                data_manager.update_results(result)
-                        else:
-                            self.logger.warning(f"Не удалось получить данные для {company.name}")
-                            
-                    except Exception as e:
-                        self.logger.error(f"Ошибка при обработке компании {company.name}: {e}")
-                
-                self.logger.info(f"Завершена обработка компаний через API Dadata, успешно: {len(results)} из {len(companies)}")
+                except Exception as e:
+                    self.logger.error(f"Ошибка при обработке компании {company.name}: {e}")
+            
+            self.logger.info(f"Завершена обработка компаний через API Dadata, успешно: {len(results)} из {len(companies)}")
             
         except Exception as e:
             self.logger.error(f"Ошибка при инициализации API Dadata: {e}")
         finally:
+            # Закрываем клиент Dadata
+            if self.dadata:
+                try:
+                    await self.dadata.close()
+                except:
+                    pass
             self.dadata = None
         
         return results
     
     async def parse_company(self, company: CompanyData) -> Optional[CompanyData]:
         """
-        Получает информацию о руководителе компании через API dadata.ru
+        Получает информацию о руководителе компании через API dadata.ru и его ИНН через сайт Райффайзен банка
         
         :param company: Объект с данными о компании
         :return: Обновленный объект с данными о компании или None в случае ошибки
         """
-        if not self.dadata:
-            self.logger.error("Клиент Dadata не инициализирован")
-            return None
+        # Максимальное количество попыток с разными ключами
+        max_attempts = max(1, self.dadata_keys.get_all_keys_count())
+        
+        for attempt in range(max_attempts):
+            # Создаем клиент Dadata, если он еще не создан
+            if not self.dadata:
+                self.dadata = await self._create_dadata_client()
+                if not self.dadata:
+                    self.logger.error("Не удалось создать клиент Dadata")
+                    return None
+            
+            try:
+                # Поиск компании по ИНН
+                organizations = await self.dadata.find_by_id(name="party", query=company.inn)
+                
+                if not organizations:
+                    self.logger.warning(f"Компания с ИНН {company.inn} не найдена в dadata.ru")
+                    # Возвращаем данные с отметкой "не найдено"
+                    company.chairman_name = "не найдено"
+                    company.chairman_inn = "не найдено"
+                    return company
+                
+                # Берем первую найденную организацию (обычно самую релевантную)
+                org_data = organizations[0]['data']
+                
+                # Проверяем наличие данных о руководителе
+                if org_data.get('management') and org_data['management'].get('name'):
+                    # Извлекаем имя руководителя
+                    chairman_name = org_data['management']['name']
+                    company.chairman_name = chairman_name
+                    self.logger.info(f"Найден руководитель: {chairman_name}")
+                    
+                    # Попытка найти ИНН в данных от Dadata, если он там есть
+                    chairman_inn = None
+                    
+                    if org_data.get('managers') and len(org_data['managers']) > 0:
+                        for manager in org_data['managers']:
+                            if manager.get('post') and ('председатель' in manager['post'].lower() or 'директор' in manager['post'].lower() or 'руководитель' in manager['post'].lower()):
+                                if manager.get('inn'):
+                                    chairman_inn = manager['inn']
+                                    self.logger.info(f"Найден ИНН руководителя в Dadata: {chairman_inn}")
+                                    break
+                    
+                    # Если ИНН не найден в Dadata, пытаемся получить его через сайт Райффайзен банка
+                    if not chairman_inn:
+                        chairman_inn = await self._get_chairman_inn_via_raiffeisen(chairman_name)
+                        
+                        if chairman_inn:
+                            self.logger.info(f"Получен ИНН руководителя через сайт Райффайзен: {chairman_inn}")
+                        else:
+                            self.logger.warning(f"Не удалось получить ИНН руководителя {chairman_name} через сайт Райффайзен")
+                            chairman_inn = "не найдено"
+                    
+                    company.chairman_inn = chairman_inn
+                else:
+                    # Информация о руководителе не найдена
+                    company.chairman_name = "не найдено"
+                    company.chairman_inn = "не найдено"
+                    self.logger.warning(f"Данные о руководителе компании {company.name} не найдены в dadata.ru")
+                
+                # Сбрасываем счетчик неудачных попыток для текущего ключа, так как запрос успешен
+                current_key = self.dadata_keys.get_current_key()
+                if current_key in self.failed_key_attempts:
+                    del self.failed_key_attempts[current_key]
+                
+                return company
+                
+            except Exception as e:
+                import httpx
+                
+                # Проверяем тип ошибки и обрабатываем его
+                if isinstance(e, httpx.HTTPStatusError):
+                    current_key = self.dadata_keys.get_current_key()
+                    
+                    # Проверяем, является ли ошибка ошибкой авторизации (403 Forbidden)
+                    if e.response.status_code == 403:
+                        self.logger.error(
+                            f"Ошибка при получении данных из API dadata.ru: ошибка авторизации (403 Forbidden). "
+                            f"Проверьте правильность API-ключа. Получите действительный токен на сайте https://dadata.ru/profile/#info"
+                        )
+                        
+                        # Отмечаем этот ключ как неудачный и пробуем следующий
+                        self.failed_key_attempts[current_key] = self.failed_key_attempts.get(current_key, 0) + 1
+                        
+                        # Если этот ключ уже несколько раз подряд не работал, переходим к следующему
+                        if self.failed_key_attempts.get(current_key, 0) >= self.max_key_attempts:
+                            self.logger.warning(f"Ключ многократно вызывал ошибку авторизации, пробуем другой ключ")
+                            
+                            # Закрываем текущий клиент и пробуем создать новый с другим ключом
+                            if self.dadata:
+                                try:
+                                    await self.dadata.close()
+                                except:
+                                    pass
+                            
+                            self.dadata = await self._rotate_dadata_client()
+                    
+                    # Если ошибка связана с превышением лимита запросов (429 Too Many Requests)
+                    elif e.response.status_code == 429:
+                        self.logger.warning(f"Превышен лимит запросов для API-ключа Dadata, переключаемся на другой ключ")
+                        
+                        # Закрываем текущий клиент и пробуем создать новый с другим ключом
+                        if self.dadata:
+                            try:
+                                await self.dadata.close()
+                            except:
+                                pass
+                        
+                        self.dadata = await self._rotate_dadata_client()
+                    else:
+                        self.logger.error(f"Ошибка HTTP при получении данных из API dadata.ru: {e}")
+                else:
+                    self.logger.error(f"Ошибка при получении данных из API dadata.ru: {e}")
+                
+                # Если мы перепробовали все ключи и попытки, возвращаем None
+                if attempt >= max_attempts - 1:
+                    self.logger.error(f"Исчерпаны все попытки получения данных о компании {company.name}")
+                    return None
+        
+        return None
+    
+    async def _get_chairman_inn_via_raiffeisen(self, full_name: str) -> Optional[str]:
+        """
+        Получает ИНН физического лица по ФИО через сайт Райффайзен банка
+        
+        :param full_name: Полное имя руководителя (ФИО)
+        :return: ИНН руководителя или None, если не удалось получить
+        """
+        self.logger.info(f"Поиск ИНН для {full_name} через сайт Райффайзен банка")
         
         try:
-            # Поиск компании по ИНН
-            organizations = await self.dadata.find_by_id(name="party", query=company.inn)
+            # Инициализация браузера
+            chromedriver_path = os.path.join(os.getcwd(), 'chromedriver.exe')
+            if not os.path.exists(chromedriver_path):
+                chromedriver_path = 'C:/chromedriver/chromedriver.exe'
+                if not os.path.exists(chromedriver_path):
+                    self.logger.error(f"ChromeDriver не найден по указанным путям")
+                    return None
             
-            if not organizations:
-                self.logger.warning(f"Компания с ИНН {company.inn} не найдена в dadata.ru")
-                # Возвращаем данные с отметкой "не найдено"
-                company.chairman_name = "не найдено"
-                company.chairman_inn = "не найдено"
-                return company
+            # Настройка Chrome
+            options = Options()
+            options.add_argument('--headless')  # Запуск в фоновом режиме
+            options.add_argument('--no-sandbox')
+            options.add_argument('--disable-dev-shm-usage')
+            options.add_argument('--ignore-certificate-errors')
+            options.add_argument('--ignore-ssl-errors')
+            options.add_argument('--log-level=3')  # Уменьшаем вывод логов браузера
             
-            # Берем первую найденную организацию (обычно самую релевантную)
-            org_data = organizations[0]['data']
+            # Создаем сервис и драйвер
+            service = Service(executable_path=chromedriver_path)
+            driver = webdriver.Chrome(service=service, options=options)
+            driver.set_page_load_timeout(60)  # Таймаут загрузки страницы (секунды)
+            wait = WebDriverWait(driver, 10)  # Таймаут для ожидания элементов (секунды)
             
-            # Проверяем наличие данных о руководителе
-            if org_data.get('management') and org_data['management'].get('name'):
-                # Извлекаем имя руководителя
-                company.chairman_name = org_data['management']['name']
-                self.logger.info(f"Найден руководитель: {company.chairman_name}")
+            try:
+                # Загрузка страницы
+                self.logger.info("Открываем сайт reg-raiffeisen.ru")
+                driver.get("https://reg-raiffeisen.ru/")
                 
-                # ИНН руководителя не доступен в бесплатном API, но мы можем попытаться найти 
-                # его в списке managers, если он там есть
-                if org_data.get('managers') and len(org_data['managers']) > 0:
-                    for manager in org_data['managers']:
-                        if manager.get('post') and ('председатель' in manager['post'].lower() or 'директор' in manager['post'].lower() or 'руководитель' in manager['post'].lower()):
-                            if manager.get('inn'):
-                                company.chairman_inn = manager['inn']
-                                self.logger.info(f"Найден ИНН руководителя: {company.chairman_inn}")
-                                break
+                # Прокручиваем страницу вниз
+                driver.execute_script("window.scrollTo(0, document.body.scrollHeight);")
                 
-                # Если не нашли ИНН руководителя, ставим соответствующую отметку
-                if not company.chairman_inn:
-                    company.chairman_inn = "не найдено через API"
-            else:
-                # Информация о руководителе не найдена
-                company.chairman_name = "не найдено"
-                company.chairman_inn = "не найдено"
-                self.logger.warning(f"Данные о руководителе компании {company.name} не найдены в dadata.ru")
+                # Находим поле ввода для поиска ИП или ООО
+                try:
+                    # Попытка найти поле ввода по XPath
+                    xpath = "/html/body/div[1]/div[3]/div/div[2]/div[14]/div[2]/div/div/div/div/form/div[1]/div[1]/div/div/div[1]/div/div/div/div[1]/div[1]/input"
+                    input_field = wait.until(EC.presence_of_element_located((By.XPATH, xpath)))
+                except Exception:
+                    # Если XPath не сработал, пробуем найти по ID или другим атрибутам
+                    self.logger.info("Поиск поля ввода по ID или атрибутам")
+                    try:
+                        input_field = wait.until(EC.presence_of_element_located((By.ID, "party")))
+                    except Exception:
+                        # Последняя попытка - найти по названию
+                        input_field = wait.until(EC.presence_of_element_located((By.NAME, "party")))
                 
-            return company
-            
+                # Прокручиваем страницу к полю ввода
+                driver.execute_script("arguments[0].scrollIntoView({block: 'center'});", input_field)
+                
+                # Делаем паузу перед вводом
+                await asyncio.sleep(1)
+                
+                # Очищаем поле ввода и вводим ФИО
+                input_field.clear()
+                input_field.send_keys(full_name)
+                
+                # Ждем появления выпадающего списка с подсказками
+                self.logger.info(f"Ожидаем результаты автоподсказки для {full_name}")
+                autocomplete_list = wait.until(EC.presence_of_element_located((By.CLASS_NAME, "autocomplete-list")))
+                
+                # Ждем небольшую паузу для полной загрузки списка
+                await asyncio.sleep(2)
+                
+                # Находим все элементы списка
+                list_items = autocomplete_list.find_elements(By.TAG_NAME, "li")
+                
+                if not list_items:
+                    self.logger.warning(f"Автоподсказки для {full_name} не найдены")
+                    return None
+                
+                # Берем первый элемент списка
+                first_item = list_items[0]
+                
+                # Находим элемент с деталями (содержит ИНН)
+                detail_element = first_item.find_element(By.CLASS_NAME, "ie_detail")
+                detail_text = detail_element.text
+                
+                # Используем регулярное выражение для извлечения ИНН
+                inn_match = re.search(r'(\d{12}|\d{10})', detail_text)
+                
+                if inn_match:
+                    inn = inn_match.group(1)
+                    self.logger.info(f"Извлечен ИНН {inn} для {full_name}")
+                    return inn
+                else:
+                    self.logger.warning(f"Не удалось извлечь ИНН из текста: {detail_text}")
+                    return None
+                
+            except Exception as e:
+                self.logger.error(f"Ошибка при парсинге сайта Райффайзен: {e}")
+                return None
+            finally:
+                # Закрываем браузер в любом случае
+                try:
+                    driver.quit()
+                except Exception as e:
+                    self.logger.error(f"Ошибка при закрытии браузера: {e}")
+        
         except Exception as e:
-            import httpx
-            # Проверяем, является ли ошибка ошибкой авторизации (403 Forbidden)
-            if isinstance(e, httpx.HTTPStatusError) and e.response.status_code == 403:
-                self.logger.error(
-                    f"Ошибка при получении данных из API dadata.ru: ошибка авторизации (403 Forbidden). "
-                    f"Проверьте правильность API-ключа. Получите действительный токен на сайте https://dadata.ru/profile/#info"
-                )
-            else:
-                self.logger.error(f"Ошибка при получении данных из API dadata.ru: {e}")
+            self.logger.error(f"Ошибка при инициализации браузера: {e}")
             return None
     
     def _get_data_manager(self) -> Optional[DataManager]:

@@ -28,11 +28,32 @@ is_saving = False
 # Флаг для обозначения, что программа завершается
 is_exiting = False
 
-# Получение токена Dadata из переменных окружения или установка пустого значения для демонстрации
-# В реальном использовании установите переменную окружения DADATA_TOKEN с вашим API-ключом
-# export DADATA_TOKEN=ваш_токен
-# Для демонстрации можно заменить на реальный токен, например:
-# os.environ['DADATA_TOKEN'] = 'ваш_токен_dadata'
+# Функция для загрузки API ключей из переменных окружения
+def load_api_keys(env_prefix):
+    """
+    Загружает все API ключи с указанным префиксом из переменных окружения
+    
+    :param env_prefix: Префикс для переменных окружения (например, 'DADATA_TOKEN')
+    :return: Список найденных ключей
+    """
+    keys = []
+    
+    # Ищем основной ключ
+    main_key = os.getenv(env_prefix)
+    if main_key:
+        keys.append(main_key)
+    
+    # Ищем дополнительные ключи с номерами (DADATA_TOKEN_1, DADATA_TOKEN_2 и т.д.)
+    i = 1
+    while True:
+        key = os.getenv(f"{env_prefix}_{i}")
+        if not key:
+            break
+        keys.append(key)
+        i += 1
+    
+    logger.info(f"Загружено {len(keys)} ключей с префиксом {env_prefix}")
+    return keys
 
 # Функция для форсированного сохранения при любом завершении
 @atexit.register
@@ -119,16 +140,20 @@ async def main():
         # Инициализация менеджера парсеров
         parser_manager = ParserManager(data_manager)
         
-        # Добавление парсеров для каждого сайта
-        # Добавляем парсер для Dadata (токен должен быть получен при регистрации на сайте dadata.ru)
-        # ВАЖНО: Для корректной работы необходимо указать полный действительный токен
-        # Текущий токен неполный и приводит к ошибке 403 Forbidden
-        # Получите действительный токен на сайте https://dadata.ru/profile/#info
+        # Добавление парсера Dadata с поддержкой множественных API ключей
+        # Загружаем ключи Dadata из переменных окружения
         dadata_token = os.getenv('DADATA_TOKEN')
-        if dadata_token:
-            parser_manager.add_parser(DadataParser(token=dadata_token, rate_limit=0.2))
+        
+        # Загружаем ключи для Dadata (FNS больше не используется, т.к. ИНН получаем через сайт)
+        dadata_keys = load_api_keys('DADATA_TOKEN')
+        
+        # Добавляем парсер только если есть хотя бы один ключ Dadata
+        if dadata_keys:
+            # Используем только первый ключ из списка для передачи в конструктор
+            # Остальные ключи будут загружены автоматически из переменных окружения
+            parser_manager.add_parser(DadataParser(token=dadata_keys[0], rate_limit=0.2))
         else:
-            logger.warning("Переменная окружения DADATA_TOKEN не задана, парсер Dadata не будет использоваться")
+            logger.warning("Переменные окружения для DADATA_TOKEN не заданы, парсер Dadata не будет использоваться")
             
         # Добавляем стандартные парсеры
         # parser_manager.add_parser(FocusKonturParser(rate_limit=5.0))
