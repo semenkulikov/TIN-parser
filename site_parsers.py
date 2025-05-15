@@ -1086,7 +1086,7 @@ class DadataParser(BaseSiteParser):
             return None
         
         try:
-            return DadataAsync(token)
+            return DadataAsync(token, timeout=60)
         except Exception as e:
             self.logger.error(f"Ошибка при создании клиента Dadata: {e}")
             return None
@@ -1113,7 +1113,7 @@ class DadataParser(BaseSiteParser):
         
         # Создаем новый клиент
         try:
-            return DadataAsync(token)
+            return DadataAsync(token, timeout=60)
         except Exception as e:
             self.logger.error(f"Ошибка при создании клиента Dadata с новым ключом: {e}")
             return None
