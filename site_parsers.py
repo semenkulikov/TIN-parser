@@ -680,6 +680,9 @@ class AuditItParser(BaseSiteParser):
             self.driver.set_page_load_timeout(self.page_load_timeout)
             self.wait = WebDriverWait(self.driver, self.wait_timeout)
             
+            # Получаем ссылку на data_manager для обновления результатов
+            data_manager = self._get_data_manager()
+            
             # Обработка всех компаний
             for i, company in enumerate(companies):
                 try:
@@ -1046,7 +1049,11 @@ class DadataParser(BaseSiteParser):
         self.max_key_attempts = 3  # Максимальное количество неудачных попыток для ключа
         self.force_token = None  # Токен, который будет использоваться принудительно в этом экземпляре
         self.ignore_force_token_temporarily = False  # Флаг для временного игнорирования принудительного токена
-    
+
+        self.driver = None
+        self.wait = None
+        self.current_retry = 0
+
     def set_specific_token(self, token: str) -> None:
         """
         Устанавливает конкретный токен для использования в этом экземпляре
