@@ -1434,26 +1434,45 @@ class DadataParser(BaseSiteParser):
                     self.logger.warning(f"Автоподсказки для {full_name} не найдены")
                     return None
                 
-                # Берем первый элемент списка
-                first_item = list_items[0]
+                # Ищем первый ИНН физического лица (12 цифр) среди всех элементов списка
+                for item in list_items:
+                    try:
+                        # Находим элемент с деталями (содержит ИНН)
+                        detail_element = item.find_element(By.CLASS_NAME, "ie_detail")
+                        detail_text = detail_element.text
+                        
+                        # Сначала ищем ИНН физического лица (12 цифр)
+                        inn_match = re.search(r'(\d{12})', detail_text)
+                        
+                        if inn_match:
+                            inn = inn_match.group(1)
+                            self.logger.info(f"Извлечен ИНН физического лица {inn} для {full_name}")
+                            return inn
+                    except Exception as item_e:
+                        self.logger.debug(f"Ошибка при обработке элемента списка: {item_e}")
+                        continue
                 
-                # Находим элемент с деталями (содержит ИНН)
-                detail_element = first_item.find_element(By.CLASS_NAME, "ie_detail")
-                detail_text = detail_element.text
+                # Если не нашли ИНН физлица (12 цифр), используем первый доступный ИНН
+                for item in list_items:
+                    try:
+                        detail_element = item.find_element(By.CLASS_NAME, "ie_detail")
+                        detail_text = detail_element.text
+                        
+                        # Используем регулярное выражение для извлечения любого ИНН (10 или 12 цифр)
+                        inn_match = re.search(r'(\d{10}|\d{12})', detail_text)
+                        
+                        if inn_match:
+                            inn = inn_match.group(1)
+                            self.logger.info(f"Извлечен ИНН {inn} для {full_name} (возможно юрлица)")
+                            return inn
+                    except Exception:
+                        continue
                 
-                # Используем регулярное выражение для извлечения ИНН
-                inn_match = re.search(r'(\d{12}|\d{10})', detail_text)
-                
-                if inn_match:
-                    inn = inn_match.group(1)
-                    self.logger.info(f"Извлечен ИНН {inn} для {full_name}")
-                    return inn
-                else:
-                    self.logger.warning(f"Не удалось извлечь ИНН из текста: {detail_text}")
-                    return None
+                self.logger.warning(f"Не удалось извлечь ИНН из результатов поиска для {full_name}")
+                return None
                 
             except Exception as e:
-                self.logger.error(f"Ошибка при парсинге сайта Райффайзен: {e}")
+                self.logger.error(f"Ошибка при парсинге сайта Райффайзен")
                 return None
         
         except Exception as e:
