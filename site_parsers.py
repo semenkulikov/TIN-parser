@@ -1425,7 +1425,7 @@ class DadataParser(BaseSiteParser):
                 autocomplete_list = self.wait.until(EC.presence_of_element_located((By.CLASS_NAME, "autocomplete-list")))
                 
                 # Ждем небольшую паузу для полной загрузки списка
-                await asyncio.sleep(2)
+                await asyncio.sleep(4)
                 
                 # Находим все элементы списка
                 list_items = autocomplete_list.find_elements(By.TAG_NAME, "li")
@@ -1463,8 +1463,8 @@ class DadataParser(BaseSiteParser):
                         
                         if inn_match:
                             inn = inn_match.group(1)
-                            self.logger.info(f"Извлечен ИНН {inn} для {full_name} (возможно юрлица)")
-                            return inn
+                            self.logger.info(f"Извлечен ИНН {inn} для {full_name} (возможно физлица)")
+                            return inn + "физ. лицо"
                     except Exception:
                         continue
                 
