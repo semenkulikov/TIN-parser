@@ -178,6 +178,14 @@ async def main():
         logger.info(f"Работа парсера завершена. Обработано {processed_count} компаний за {total_time:.2f} секунд")
         if processed_count > 0:
             logger.info(f"Среднее время на компанию: {total_time/processed_count:.2f} секунд")
+        
+        # Закрываем все процессы хрома через os.system
+        logger.info("Закрываем все процессы хрома...")
+        try:
+            os.system("taskkill /f /im chrome.exe")
+            logger.info("Все процессы хрома успешно закрыты")
+        except Exception as e:
+            logger.error(f"Ошибка при закрытии процессов хрома: {e}")
     except KeyboardInterrupt:
         # Перехватываем Ctrl+C для корректного завершения
         if data_manager and not is_saving:

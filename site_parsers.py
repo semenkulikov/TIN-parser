@@ -181,11 +181,8 @@ class FocusKonturParser(BaseSiteParser):
                                 raise WebDriverException  # Проверка активности браузера
                         except WebDriverException:
                             self.logger.warning("Браузер перестал отвечать, перезапускаем")
-                            if self.driver:
-                                try:
-                                    self.driver.quit()
-                                except Exception:
-                                    pass
+                            # Корректно закрываем браузер перед пересозданием
+                            self._ensure_browser_closed()
                                     
                             # Пересоздаем драйвер
                             self.driver = webdriver.Chrome(service=service, options=self.options)
@@ -194,20 +191,27 @@ class FocusKonturParser(BaseSiteParser):
                             
                 except Exception as e:
                     self.logger.error(f"Ошибка при обработке компании {company.name}: {e}")
+                    # Если произошла ошибка во время обработки компании, гарантируем закрытие браузера
+                    if i < len(companies) - 1:  # Если это не последняя компания
+                        self.logger.info("Перезапуск браузера после ошибки")
+                        self._ensure_browser_closed()
+                        
+                        # Пересоздаем драйвер
+                        try:
+                            self.driver = webdriver.Chrome(service=service, options=self.options)
+                            self.driver.set_page_load_timeout(self.page_load_timeout)
+                            self.wait = WebDriverWait(self.driver, self.wait_timeout)
+                        except Exception as browser_error:
+                            self.logger.error(f"Не удалось перезапустить браузер: {browser_error}")
+                            break  # Прекращаем обработку, если браузер не удалось перезапустить
             
             self.logger.info(f"Завершена обработка компаний, успешно: {len(results)} из {len(companies)}")
             
         except Exception as e:
             self.logger.error(f"Ошибка при инициализации браузера: {e}")
         finally:
-            # Закрываем браузер только один раз после обработки всех компаний
-            if self.driver:
-                try:
-                    self.driver.quit()
-                except Exception as e:
-                    self.logger.error(f"Ошибка при закрытии браузера: {e}")
-                self.driver = None
-                self.wait = None
+            # Гарантируем закрытие браузера в любом случае
+            self._ensure_browser_closed()
         
         return results
     
@@ -446,6 +450,23 @@ class FocusKonturParser(BaseSiteParser):
         except Exception as e:
             self.logger.error(f"Ошибка при получении data_manager: {e}")
             return None
+
+    def _ensure_browser_closed(self) -> None:
+        """
+        Надежное закрытие браузера
+        """
+        if self.driver:
+            try:
+                self.logger.info("Закрываем браузер...")
+                # Закрываем браузер стандартным способом
+                self.driver.quit()
+                self.logger.info("Браузер успешно закрыт")
+            except Exception as e:
+                self.logger.error(f"Ошибка при закрытии браузера: {e}")
+            finally:
+                # Гарантируем, что ссылки на драйвер сбрасываются в любом случае
+                self.driver = None
+                self.wait = None
 
 class CheckoParser(BaseSiteParser):
     """Парсер для сайта checko.ru"""
@@ -720,14 +741,8 @@ class AuditItParser(BaseSiteParser):
         except Exception as e:
             self.logger.error(f"Ошибка при инициализации браузера: {e}")
         finally:
-            # Закрываем браузер только один раз после обработки всех компаний
-            if self.driver:
-                try:
-                    self.driver.quit()
-                except Exception as e:
-                    self.logger.error(f"Ошибка при закрытии браузера: {e}")
-                self.driver = None
-                self.wait = None
+            # Гарантируем закрытие браузера в любом случае
+            self._ensure_browser_closed()
         
         return results
     
@@ -932,6 +947,43 @@ class AuditItParser(BaseSiteParser):
         company.chairman_inn = "не найдено"
         return company
 
+    def _get_data_manager(self) -> Optional[DataManager]:
+        """
+        Получает объект DataManager из текущего экземпляра BaseSiteParser
+        через поиск в родительских объектах
+        
+        :return: Экземпляр DataManager или None
+        """
+        try:
+            # Получаем доступ к родительскому объекту ParserManager
+            frame = sys._getframe(2)
+            while frame:
+                if 'self' in frame.f_locals:
+                    parser_manager = frame.f_locals['self']
+                    if hasattr(parser_manager, 'data_manager'):
+                        return parser_manager.data_manager
+                frame = frame.f_back
+        except Exception as e:
+            self.logger.debug(f"Не удалось получить доступ к data_manager: {e}")
+        return None 
+
+    def _ensure_browser_closed(self) -> None:
+        """
+        Надежное закрытие браузера
+        """
+        if self.driver:
+            try:
+                self.logger.info("Закрываем браузер...")
+                # Закрываем браузер стандартным способом
+                self.driver.quit()
+                self.logger.info("Браузер успешно закрыт")
+            except Exception as e:
+                self.logger.error(f"Ошибка при закрытии браузера: {e}")
+            finally:
+                # Гарантируем, что ссылки на драйвер сбрасываются в любом случае
+                self.driver = None
+                self.wait = None
+
 class RbcCompaniesParser(BaseSiteParser):
     """Парсер для сайта companies.rbc.ru"""
     
@@ -1036,7 +1088,7 @@ class DadataParser(BaseSiteParser):
 
         # Настройка Chrome
         self.options = Options()
-        self.options.add_argument('--headless')  # Запуск в фоновом режиме
+        # self.options.add_argument('--headless')  # Запуск в фоновом режиме
         self.options.add_argument('--no-sandbox')
         self.options.add_argument('--disable-dev-shm-usage')
         self.options.add_argument('--ignore-certificate-errors')
@@ -1291,12 +1343,19 @@ class DadataParser(BaseSiteParser):
                             cur_city = address.split(",")[0]
                         except Exception:
                             pass
-                        chairman_inn = await self._get_chairman_inn_via_raiffeisen(chairman_name)
-                        
-                        if chairman_inn:
-                            self.logger.info(f"Получен ИНН руководителя через сайт Райффайзен: {chairman_inn}")
-                        else:
-                            self.logger.warning(f"Не удалось получить ИНН руководителя {chairman_name} через сайт Райффайзен")
+                            
+                        try:
+                            chairman_inn = await self._get_chairman_inn_via_raiffeisen(chairman_name)
+                            
+                            if chairman_inn:
+                                self.logger.info(f"Получен ИНН руководителя через сайт Райффайзен: {chairman_inn}")
+                            else:
+                                self.logger.warning(f"Не удалось получить ИНН руководителя {chairman_name} через сайт Райффайзен")
+                                chairman_inn = "не найдено"
+                        except Exception as raiffeisen_error:
+                            self.logger.error(f"Ошибка при получении ИНН через Райффайзен: {raiffeisen_error}")
+                            # Гарантируем закрытие браузера при ошибке
+                            self._ensure_browser_closed()
                             chairman_inn = "не найдено"
                     
                     company.chairman_inn = chairman_inn
@@ -1374,8 +1433,12 @@ class DadataParser(BaseSiteParser):
                 # Если мы перепробовали все ключи и попытки, возвращаем None
                 if attempt >= max_attempts - 1:
                     self.logger.error(f"Исчерпаны все попытки получения данных о компании {company.name}")
+                    # Убедимся, что браузер закрыт в случае ошибки
+                    self._ensure_browser_closed()
                     return None
         
+        # Убедимся, что браузер закрыт перед возвратом из функции
+        self._ensure_browser_closed()
         return None
     
     async def _get_chairman_inn_via_raiffeisen(self, full_name: str) -> Optional[str]:
@@ -1388,95 +1451,91 @@ class DadataParser(BaseSiteParser):
         self.logger.info(f"Поиск ИНН для {full_name} через сайт Райффайзен банка")
         
         try:
+            # Загрузка страницы
+            self.logger.info("Открываем сайт reg-raiffeisen.ru")
+            self.driver.get("https://reg-raiffeisen.ru/")
+            
+            # Прокручиваем страницу вниз
+            self.driver.execute_script("window.scrollTo(0, document.body.scrollHeight);")
+            
+            # Находим поле ввода для поиска ИП или ООО
             try:
-                # Загрузка страницы
-                self.logger.info("Открываем сайт reg-raiffeisen.ru")
-                self.driver.get("https://reg-raiffeisen.ru/")
-                
-                # Прокручиваем страницу вниз
-                self.driver.execute_script("window.scrollTo(0, document.body.scrollHeight);")
-                
-                # Находим поле ввода для поиска ИП или ООО
+                # Попытка найти поле ввода по XPath
+                xpath = "/html/body/div[1]/div[3]/div/div[2]/div[14]/div[2]/div/div/div/div/form/div[1]/div[1]/div/div/div[1]/div/div/div/div[1]/div[1]/input"
+                input_field = self.wait.until(EC.presence_of_element_located((By.XPATH, xpath)))
+            except Exception:
+                # Если XPath не сработал, пробуем найти по ID или другим атрибутам
+                self.logger.info("Поиск поля ввода по ID или атрибутам")
                 try:
-                    # Попытка найти поле ввода по XPath
-                    xpath = "/html/body/div[1]/div[3]/div/div[2]/div[14]/div[2]/div/div/div/div/form/div[1]/div[1]/div/div/div[1]/div/div/div/div[1]/div[1]/input"
-                    input_field = self.wait.until(EC.presence_of_element_located((By.XPATH, xpath)))
+                    input_field = self.wait.until(EC.presence_of_element_located((By.ID, "party")))
                 except Exception:
-                    # Если XPath не сработал, пробуем найти по ID или другим атрибутам
-                    self.logger.info("Поиск поля ввода по ID или атрибутам")
-                    try:
-                        input_field = self.wait.until(EC.presence_of_element_located((By.ID, "party")))
-                    except Exception:
-                        # Последняя попытка - найти по названию
-                        input_field = self.wait.until(EC.presence_of_element_located((By.NAME, "party")))
-                
-                # Прокручиваем страницу к полю ввода
-                self.driver.execute_script("arguments[0].scrollIntoView({block: 'center'});", input_field)
-                
-                # Делаем паузу перед вводом
-                await asyncio.sleep(1)
-                
-                # Очищаем поле ввода и вводим ФИО
-                input_field.clear()
-                input_field.send_keys(full_name)
-                
-                # Ждем появления выпадающего списка с подсказками
-                self.logger.info(f"Ожидаем результаты автоподсказки для {full_name}")
-                autocomplete_list = self.wait.until(EC.presence_of_element_located((By.CLASS_NAME, "autocomplete-list")))
-                
-                # Ждем небольшую паузу для полной загрузки списка
-                await asyncio.sleep(4)
-                
-                # Находим все элементы списка
-                list_items = autocomplete_list.find_elements(By.TAG_NAME, "li")
-                
-                if not list_items:
-                    self.logger.warning(f"Автоподсказки для {full_name} не найдены")
-                    return None
-                
-                # Ищем первый ИНН физического лица (12 цифр) среди всех элементов списка
-                for item in list_items:
-                    try:
-                        # Находим элемент с деталями (содержит ИНН)
-                        detail_element = item.find_element(By.CLASS_NAME, "ie_detail")
-                        detail_text = detail_element.text
-                        
-                        # Сначала ищем ИНН физического лица (12 цифр)
-                        inn_match = re.search(r'(\d{12})', detail_text)
-                        
-                        if inn_match:
-                            inn = inn_match.group(1)
-                            self.logger.info(f"Извлечен ИНН физического лица {inn} для {full_name}")
-                            return inn
-                    except Exception as item_e:
-                        self.logger.debug(f"Ошибка при обработке элемента списка: {item_e}")
-                        continue
-                
-                # Если не нашли ИНН физлица (12 цифр), используем первый доступный ИНН
-                for item in list_items:
-                    try:
-                        detail_element = item.find_element(By.CLASS_NAME, "ie_detail")
-                        detail_text = detail_element.text
-                        
-                        # Используем регулярное выражение для извлечения любого ИНН (10 или 12 цифр)
-                        inn_match = re.search(r'(\d{10}|\d{12})', detail_text)
-                        
-                        if inn_match:
-                            inn = inn_match.group(1)
-                            self.logger.info(f"Извлечен ИНН {inn} для {full_name} (возможно физлица)")
-                            return inn + "физ. лицо"
-                    except Exception:
-                        continue
-                
-                self.logger.warning(f"Не удалось извлечь ИНН из результатов поиска для {full_name}")
+                    # Последняя попытка - найти по названию
+                    input_field = self.wait.until(EC.presence_of_element_located((By.NAME, "party")))
+            
+            # Прокручиваем страницу к полю ввода
+            self.driver.execute_script("arguments[0].scrollIntoView({block: 'center'});", input_field)
+            
+            # Делаем паузу перед вводом
+            await asyncio.sleep(1)
+            
+            # Очищаем поле ввода и вводим ФИО
+            input_field.clear()
+            input_field.send_keys(full_name)
+            
+            # Ждем появления выпадающего списка с подсказками
+            self.logger.info(f"Ожидаем результаты автоподсказки для {full_name}")
+            autocomplete_list = self.wait.until(EC.presence_of_element_located((By.CLASS_NAME, "autocomplete-list")))
+            
+            # Ждем небольшую паузу для полной загрузки списка
+            await asyncio.sleep(2)
+            
+            # Находим все элементы списка
+            list_items = autocomplete_list.find_elements(By.TAG_NAME, "li")
+            
+            if not list_items:
+                self.logger.warning(f"Автоподсказки для {full_name} не найдены")
                 return None
+            
+            # Ищем первый ИНН физического лица (12 цифр) среди всех элементов списка
+            for item in list_items:
+                try:
+                    # Находим элемент с деталями (содержит ИНН)
+                    detail_element = item.find_element(By.CLASS_NAME, "ie_detail")
+                    detail_text = detail_element.text
+                    
+                    # Сначала ищем ИНН физического лица (12 цифр)
+                    inn_match = re.search(r'(\d{12})', detail_text)
+                    
+                    if inn_match:
+                        inn = inn_match.group(1)
+                        self.logger.info(f"Извлечен ИНН физического лица {inn} для {full_name}")
+                        return inn
+                except Exception as item_e:
+                    self.logger.debug(f"Ошибка при обработке элемента списка: {item_e}")
+                    continue
+            
+            # Если не нашли ИНН физлица (12 цифр), используем первый доступный ИНН
+            for item in list_items:
+                try:
+                    detail_element = item.find_element(By.CLASS_NAME, "ie_detail")
+                    detail_text = detail_element.text
+                    
+                    # Используем регулярное выражение для извлечения любого ИНН (10 или 12 цифр)
+                    inn_match = re.search(r'(\d{10}|\d{12})', detail_text)
+                    
+                    if inn_match:
+                        inn = inn_match.group(1)
+                        self.logger.info(f"Извлечен ИНН {inn} для {full_name} (возможно физлица)")
+                        return inn
+                except Exception:
+                    continue
+            
+            self.logger.warning(f"Не удалось извлечь ИНН из результатов поиска для {full_name}")
+            return None
                 
-            except Exception as e:
-                self.logger.error(f"Ошибка при парсинге сайта Райффайзен")
-                return None
-        
-        except Exception as e:
-            self.logger.error(f"Ошибка при инициализации браузера: {e}")
+        except Exception:
+            self.logger.error(f"Ошибка при парсинге сайта Райффайзен! Засыпаем на 3 минуты")
+            await asyncio.sleep(180)
             return None
     
     def _get_data_manager(self) -> Optional[DataManager]:
@@ -1498,3 +1557,20 @@ class DadataParser(BaseSiteParser):
         except Exception as e:
             self.logger.debug(f"Не удалось получить доступ к data_manager: {e}")
         return None 
+
+    def _ensure_browser_closed(self) -> None:
+        """
+        Надежное закрытие браузера
+        """
+        if self.driver:
+            try:
+                self.logger.info("Закрываем браузер...")
+                # Закрываем браузер стандартным способом
+                self.driver.quit()
+                self.logger.info("Браузер успешно закрыт")
+            except Exception as e:
+                self.logger.error(f"Ошибка при закрытии браузера: {e}")
+            finally:
+                # Гарантируем, что ссылки на драйвер сбрасываются в любом случае
+                self.driver = None
+                self.wait = None
