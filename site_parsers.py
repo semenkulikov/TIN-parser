@@ -1225,7 +1225,7 @@ class DadataParser(BaseSiteParser):
             # Создаем сервис и драйвер
             service = Service(executable_path=chromedriver_path)
             self.driver = webdriver.Chrome(service=service, options=self.options)
-            self.driver.set_page_load_timeout(60)  # Таймаут загрузки страницы (секунды)
+            self.driver.set_page_load_timeout(90)  # Таймаут загрузки страницы (секунды)
             self.wait = WebDriverWait(self.driver, 10)  # Таймаут для ожидания элементов (секунды)
             
             # Получаем ссылку на data_manager для обновления результатов
@@ -1450,93 +1450,122 @@ class DadataParser(BaseSiteParser):
         """
         self.logger.info(f"Поиск ИНН для {full_name} через сайт Райффайзен банка")
         
-        try:
-            # Загрузка страницы
-            self.logger.info("Открываем сайт reg-raiffeisen.ru")
-            self.driver.get("https://reg-raiffeisen.ru/")
-            
-            # Прокручиваем страницу вниз
-            self.driver.execute_script("window.scrollTo(0, document.body.scrollHeight);")
-            
-            # Находим поле ввода для поиска ИП или ООО
+        # Максимальное число попыток восстановления после бана
+        max_retry_attempts = 60  # До 3 часов в случае бана (60 * 3 минуты)
+        current_retry = 0
+        
+        while True:
             try:
-                # Попытка найти поле ввода по XPath
-                xpath = "/html/body/div[1]/div[3]/div/div[2]/div[14]/div[2]/div/div/div/div/form/div[1]/div[1]/div/div/div[1]/div/div/div/div[1]/div[1]/input"
-                input_field = self.wait.until(EC.presence_of_element_located((By.XPATH, xpath)))
-            except Exception:
-                # Если XPath не сработал, пробуем найти по ID или другим атрибутам
-                self.logger.info("Поиск поля ввода по ID или атрибутам")
+                # Загрузка страницы
+                self.logger.info("Открываем сайт reg-raiffeisen.ru")
                 try:
-                    input_field = self.wait.until(EC.presence_of_element_located((By.ID, "party")))
+                    self.driver.get("https://reg-raiffeisen.ru/")
                 except Exception:
-                    # Последняя попытка - найти по названию
-                    input_field = self.wait.until(EC.presence_of_element_located((By.NAME, "party")))
-            
-            # Прокручиваем страницу к полю ввода
-            self.driver.execute_script("arguments[0].scrollIntoView({block: 'center'});", input_field)
-            
-            # Делаем паузу перед вводом
-            await asyncio.sleep(1)
-            
-            # Очищаем поле ввода и вводим ФИО
-            input_field.clear()
-            input_field.send_keys(full_name)
-            
-            # Ждем появления выпадающего списка с подсказками
-            self.logger.info(f"Ожидаем результаты автоподсказки для {full_name}")
-            autocomplete_list = self.wait.until(EC.presence_of_element_located((By.CLASS_NAME, "autocomplete-list")))
-            
-            # Ждем небольшую паузу для полной загрузки списка
-            await asyncio.sleep(2)
-            
-            # Находим все элементы списка
-            list_items = autocomplete_list.find_elements(By.TAG_NAME, "li")
-            
-            if not list_items:
-                self.logger.warning(f"Автоподсказки для {full_name} не найдены")
-                return None
-            
-            # Ищем первый ИНН физического лица (12 цифр) среди всех элементов списка
-            for item in list_items:
-                try:
-                    # Находим элемент с деталями (содержит ИНН)
-                    detail_element = item.find_element(By.CLASS_NAME, "ie_detail")
-                    detail_text = detail_element.text
-                    
-                    # Сначала ищем ИНН физического лица (12 цифр)
-                    inn_match = re.search(r'(\d{12})', detail_text)
-                    
-                    if inn_match:
-                        inn = inn_match.group(1)
-                        self.logger.info(f"Извлечен ИНН физического лица {inn} для {full_name}")
-                        return inn
-                except Exception as item_e:
-                    self.logger.debug(f"Ошибка при обработке элемента списка: {item_e}")
-                    continue
-            
-            # Если не нашли ИНН физлица (12 цифр), используем первый доступный ИНН
-            for item in list_items:
-                try:
-                    detail_element = item.find_element(By.CLASS_NAME, "ie_detail")
-                    detail_text = detail_element.text
-                    
-                    # Используем регулярное выражение для извлечения любого ИНН (10 или 12 цифр)
-                    inn_match = re.search(r'(\d{10}|\d{12})', detail_text)
-                    
-                    if inn_match:
-                        inn = inn_match.group(1)
-                        self.logger.info(f"Извлечен ИНН {inn} для {full_name} (возможно физлица)")
-                        return inn
-                except Exception:
-                    continue
-            
-            self.logger.warning(f"Не удалось извлечь ИНН из результатов поиска для {full_name}")
-            return None
+                    self.logger.error(f"Не удалось загрузить сайт!")
+                    if current_retry < max_retry_attempts:
+                        current_retry += 1
+                        self.logger.warning(f"Возможный бан по IP. Ожидание 3 минуты перед повторной попыткой (попытка {current_retry}/{max_retry_attempts})...")
+                        await asyncio.sleep(10)  # Ждем 3 минуты
+                        continue
+                    else:
+                        self.logger.error("Превышено максимальное количество попыток восстановления")
+                        return None
+
+                # Если мы здесь, значит страница успешно загрузилась
+                if current_retry > 0:
+                    self.logger.info(f"Сайт снова доступен после {current_retry} попыток!")
                 
-        except Exception:
-            self.logger.error(f"Ошибка при парсинге сайта Райффайзен! Засыпаем на 3 минуты")
-            await asyncio.sleep(180)
-            return None
+                # Прокручиваем страницу вниз
+                self.driver.execute_script("window.scrollTo(0, document.body.scrollHeight);")
+                
+                # Находим поле ввода для поиска ИП или ООО
+                try:
+                    # Попытка найти поле ввода по XPath
+                    xpath = "/html/body/div[1]/div[3]/div/div[2]/div[14]/div[2]/div/div/div/div/form/div[1]/div[1]/div/div/div[1]/div/div/div/div[1]/div[1]/input"
+                    input_field = self.wait.until(EC.presence_of_element_located((By.XPATH, xpath)))
+                except Exception:
+                    # Если XPath не сработал, пробуем найти по ID или другим атрибутам
+                    self.logger.info("Поиск поля ввода по ID или атрибутам")
+                    try:
+                        input_field = self.wait.until(EC.presence_of_element_located((By.ID, "party")))
+                    except Exception:
+                        # Последняя попытка - найти по названию
+                        input_field = self.wait.until(EC.presence_of_element_located((By.NAME, "party")))
+                
+                # Прокручиваем страницу к полю ввода
+                self.driver.execute_script("arguments[0].scrollIntoView({block: 'center'});", input_field)
+                
+                # Делаем паузу перед вводом
+                await asyncio.sleep(1)
+                
+                # Очищаем поле ввода и вводим ФИО
+                input_field.clear()
+                input_field.send_keys(full_name)
+                
+                # Ждем появления выпадающего списка с подсказками
+                self.logger.info(f"Ожидаем результаты автоподсказки для {full_name}")
+                autocomplete_list = self.wait.until(EC.presence_of_element_located((By.CLASS_NAME, "autocomplete-list")))
+                
+                # Ждем небольшую паузу для полной загрузки списка
+                await asyncio.sleep(2)
+                
+                # Находим все элементы списка
+                list_items = autocomplete_list.find_elements(By.TAG_NAME, "li")
+                
+                if not list_items:
+                    self.logger.warning(f"Автоподсказки для {full_name} не найдены")
+                    return None
+                
+                # Ищем первый ИНН физического лица (12 цифр) среди всех элементов списка
+                for item in list_items:
+                    try:
+                        # Находим элемент с деталями (содержит ИНН)
+                        detail_element = item.find_element(By.CLASS_NAME, "ie_detail")
+                        detail_text = detail_element.text
+                        
+                        # Сначала ищем ИНН физического лица (12 цифр)
+                        inn_match = re.search(r'(\d{12})', detail_text)
+                        
+                        if inn_match:
+                            inn = inn_match.group(1)
+                            self.logger.info(f"Извлечен ИНН физического лица {inn} для {full_name}")
+                            return inn
+                    except Exception as item_e:
+                        self.logger.debug(f"Ошибка при обработке элемента списка: {item_e}")
+                        continue
+                
+                # Если не нашли ИНН физлица (12 цифр), используем первый доступный ИНН
+                for item in list_items:
+                    try:
+                        detail_element = item.find_element(By.CLASS_NAME, "ie_detail")
+                        detail_text = detail_element.text
+                        
+                        # Используем регулярное выражение для извлечения любого ИНН (10 или 12 цифр)
+                        inn_match = re.search(r'(\d{10}|\d{12})', detail_text)
+                        
+                        if inn_match:
+                            inn = inn_match.group(1)
+                            self.logger.info(f"Извлечен ИНН {inn} для {full_name} (возможно юрлица)")
+                            return inn
+                    except Exception:
+                        continue
+                
+                self.logger.warning(f"Не удалось извлечь ИНН из результатов поиска для {full_name}")
+                return None
+                
+            except Exception as e:
+                self.logger.error(f"Ошибка при парсинге сайта Райффайзен!")
+                
+                # Проверяем, связана ли ошибка с доступностью сайта
+                if "ERR_CONNECTION_REFUSED" in str(e) or "ERR_CONNECTION_TIMED_OUT" in str(e) or "ERR_NAME_NOT_RESOLVED" in str(e):
+                    if current_retry < max_retry_attempts:
+                        current_retry += 1
+                        self.logger.warning(f"Проблемы с доступом к сайту. Ожидание 3 минуты (попытка {current_retry}/{max_retry_attempts})...")
+                        await asyncio.sleep(180)  # Ждем 3 минуты
+                        continue
+                
+                # Если это другая ошибка или превышено количество попыток
+                return None
     
     def _get_data_manager(self) -> Optional[DataManager]:
         """
