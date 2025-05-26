@@ -32,6 +32,63 @@ export DADATA_TOKEN_3=четвертый_токен_dadata
 
 Парсер будет автоматически переключаться на следующий ключ при превышении лимита запросов.
 
+## Конфигурация через .env файл
+
+Парсер поддерживает конфигурацию через файл `.env`. Создайте файл `.env` в корневой директории проекта и укажите нужные параметры:
+
+```
+# Параметры блокировки Райффайзен банка
+RAIFFEISEN_BLOCK_TIME_SECONDS=3600
+RAIFFEISEN_SECONDARY_WAIT_SECONDS=600
+RAIFFEISEN_MAX_RETRY_ATTEMPTS=24
+
+# Параметры браузера и ожидания
+PAGE_LOAD_TIMEOUT_SECONDS=90
+ELEMENT_WAIT_TIMEOUT_SECONDS=10
+AUTOCOMPLETE_WAIT_SECONDS=5
+MAX_KEY_ATTEMPTS=3
+
+# Задержки между запросами для разных парсеров (в секундах)
+DADATA_RATE_LIMIT=0.2
+FOCUS_KONTUR_RATE_LIMIT=5.0
+CHECKO_RATE_LIMIT=2.0
+ZACHESTNY_RATE_LIMIT=3.0
+AUDIT_IT_RATE_LIMIT=2.0
+RBC_RATE_LIMIT=2.0
+
+# Параметры сохранения данных
+SAVE_INTERVAL=50
+
+# API ключи (добавьте свои ключи)
+DADATA_TOKEN=ваш_ключ_тут
+DADATA_TOKEN_1=дополнительный_ключ_1
+DADATA_TOKEN_2=дополнительный_ключ_2
+```
+
+### Описание параметров
+
+**Блокировки Райффайзен банка:**
+- `RAIFFEISEN_BLOCK_TIME_SECONDS` - время блокировки в секундах (по умолчанию 1 час)
+- `RAIFFEISEN_SECONDARY_WAIT_SECONDS` - дополнительное время ожидания, если блокировка не снята
+- `RAIFFEISEN_MAX_RETRY_ATTEMPTS` - максимальное количество попыток восстановления после блокировки
+
+**Параметры браузера:**
+- `PAGE_LOAD_TIMEOUT_SECONDS` - таймаут загрузки страницы в секундах
+- `ELEMENT_WAIT_TIMEOUT_SECONDS` - таймаут ожидания элементов на странице
+- `AUTOCOMPLETE_WAIT_SECONDS` - время ожидания автоподсказок
+- `MAX_KEY_ATTEMPTS` - максимальное количество попыток с одним ключом API
+
+**Задержки между запросами:**
+- `DADATA_RATE_LIMIT` - задержка между запросами к Dadata API
+- `FOCUS_KONTUR_RATE_LIMIT` - задержка для focus.kontur.ru
+- `CHECKO_RATE_LIMIT` - задержка для checko.ru
+- `ZACHESTNY_RATE_LIMIT` - задержка для zachestnyibiznes.ru
+- `AUDIT_IT_RATE_LIMIT` - задержка для audit-it.ru
+- `RBC_RATE_LIMIT` - задержка для companies.rbc.ru
+
+**Сохранение данных:**
+- `SAVE_INTERVAL` - интервал автоматического сохранения (количество обработанных компаний)
+
 ## Запуск парсера
 
 ```bash

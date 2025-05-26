@@ -22,6 +22,17 @@ from parser_base import BaseSiteParser, CompanyData, DataManager
 # import undetected_chromedriver as uc
 from dadata import Dadata, DadataAsync
 
+# Импорт глобальных флагов блокировки из main.py
+try:
+    from main import is_raiffeisen_blocked, set_raiffeisen_blocked
+except ImportError:
+    # Создаем заглушки, если функции недоступны
+    def is_raiffeisen_blocked():
+        return False
+    
+    def set_raiffeisen_blocked():
+        pass
+
 class KeyRotator:
     """Класс для ротации API ключей"""
     
@@ -1094,11 +1105,16 @@ class DadataParser(BaseSiteParser):
         self.options.add_argument('--ignore-certificate-errors')
         self.options.add_argument('--ignore-ssl-errors')
         self.options.add_argument('--log-level=3')  # Уменьшаем вывод логов браузера
-            
+        
+        # Загрузка параметров из .env
+        self.page_load_timeout = int(os.getenv('PAGE_LOAD_TIMEOUT_SECONDS', '90'))
+        self.element_wait_timeout = int(os.getenv('ELEMENT_WAIT_TIMEOUT_SECONDS', '10'))
+        self.autocomplete_wait_seconds = int(os.getenv('AUTOCOMPLETE_WAIT_SECONDS', '5'))
+        self.max_key_attempts = int(os.getenv('MAX_KEY_ATTEMPTS', '3'))
+        self.raiffeisen_max_retry_attempts = int(os.getenv('RAIFFEISEN_MAX_RETRY_ATTEMPTS', '24'))
         
         self.dadata = None  # Инициализируется в parse_companies
         self.failed_key_attempts = {}  # Словарь для отслеживания неудачных попыток по ключам
-        self.max_key_attempts = 3  # Максимальное количество неудачных попыток для ключа
         self.force_token = None  # Токен, который будет использоваться принудительно в этом экземпляре
         self.ignore_force_token_temporarily = False  # Флаг для временного игнорирования принудительного токена
 
@@ -1213,20 +1229,29 @@ class DadataParser(BaseSiteParser):
         self.failed_key_attempts = {}
         
         try:
-
-            # Инициализация браузера
-            chromedriver_path = os.path.join(os.getcwd(), 'chromedriver.exe')
-            if not os.path.exists(chromedriver_path):
-                chromedriver_path = 'C:/chromedriver/chromedriver.exe'
+            # Инициализация браузера с учетом операционной системы
+            if sys.platform == 'win32':
+                # Windows путь
+                chromedriver_path = os.path.join(os.getcwd(), 'chromedriver.exe')
                 if not os.path.exists(chromedriver_path):
-                    self.logger.error(f"ChromeDriver не найден по указанным путям")
-                    return None
+                    chromedriver_path = 'C:/chromedriver/chromedriver.exe'
+                    if not os.path.exists(chromedriver_path):
+                        self.logger.error(f"ChromeDriver не найден по указанным путям Windows")
+                        return []
+            else:
+                # Linux/Mac путь
+                chromedriver_path = "./chromedriver"
+                if not os.path.exists(chromedriver_path):
+                    self.logger.error(f"ChromeDriver не найден по пути {chromedriver_path}")
+                    return []
+            
+            self.logger.info(f"Используется ChromeDriver по пути: {chromedriver_path}")
             
             # Создаем сервис и драйвер
             service = Service(executable_path=chromedriver_path)
             self.driver = webdriver.Chrome(service=service, options=self.options)
-            self.driver.set_page_load_timeout(90)  # Таймаут загрузки страницы (секунды)
-            self.wait = WebDriverWait(self.driver, 10)  # Таймаут для ожидания элементов (секунды)
+            self.driver.set_page_load_timeout(self.page_load_timeout)  # Таймаут загрузки страницы из конфигурации
+            self.wait = WebDriverWait(self.driver, self.element_wait_timeout)  # Таймаут для ожидания элементов из конфигурации
             
             # Получаем ссылку на data_manager для обновления результатов
             data_manager = self._get_data_manager()
@@ -1450,8 +1475,24 @@ class DadataParser(BaseSiteParser):
         """
         self.logger.info(f"Поиск ИНН для {full_name} через сайт Райффайзен банка")
         
+        # Проверяем глобальный флаг блокировки перед попыткой доступа
+        if is_raiffeisen_blocked():
+            self.logger.warning(f"Сайт Райфайзен банка заблокирован. Ожидаем перед повторной попыткой для {full_name}")
+            # Получаем время блокировки из .env
+            block_time_seconds = int(os.getenv('RAIFFEISEN_BLOCK_TIME_SECONDS', '3600'))
+            
+            # Уходим в сон на указанное время
+            await asyncio.sleep(block_time_seconds)
+            
+            self.logger.info(f"Возобновляем поиск ИНН для {full_name} после ожидания")
+            # После сна проверяем снова - если сайт все еще заблокирован, делаем дополнительную паузу
+            if is_raiffeisen_blocked():
+                secondary_wait = int(os.getenv('RAIFFEISEN_SECONDARY_WAIT_SECONDS', '600'))
+                self.logger.warning(f"Сайт Райфайзен банка все еще заблокирован после ожидания. Ждем еще {secondary_wait} секунд")
+                await asyncio.sleep(secondary_wait)
+        
         # Максимальное число попыток восстановления после бана
-        max_retry_attempts = 60  # До 3 часов в случае бана (60 * 3 минуты)
+        max_retry_attempts = self.raiffeisen_max_retry_attempts
         current_retry = 0
         
         while True:
@@ -1460,16 +1501,51 @@ class DadataParser(BaseSiteParser):
                 self.logger.info("Открываем сайт reg-raiffeisen.ru")
                 try:
                     self.driver.get("https://reg-raiffeisen.ru/")
-                except Exception:
-                    self.logger.error(f"Не удалось загрузить сайт!")
-                    if current_retry < max_retry_attempts:
-                        current_retry += 1
-                        self.logger.warning(f"Возможный бан по IP. Ожидание 3 минуты перед повторной попыткой (попытка {current_retry}/{max_retry_attempts})...")
-                        await asyncio.sleep(10)  # Ждем 3 минуты
-                        continue
-                    else:
-                        self.logger.error("Превышено максимальное количество попыток восстановления")
+                except Exception as e:
+                    self.logger.error(f"Не удалось загрузить сайт")
+                    
+                    # Устанавливаем глобальный флаг блокировки Райфайзен банка
+                    set_raiffeisen_blocked()
+                    self.logger.warning(f"Установлена глобальная блокировка Райфайзен банка на 1 час. Ожидаем...")
+                    
+                    # Закрываем и пересоздаем драйвер перед уходом в сон
+                    self._ensure_browser_closed()
+                    
+                    # Уходим в сон на указанное в конфигурации время
+                    block_time_seconds = int(os.getenv('RAIFFEISEN_BLOCK_TIME_SECONDS', '3600'))
+                    await asyncio.sleep(block_time_seconds)
+                    
+                    # Увеличиваем счетчик попыток
+                    current_retry += 1
+                    if current_retry >= max_retry_attempts:
+                        self.logger.error(f"Превышено максимальное количество попыток ({max_retry_attempts}) для {full_name}")
                         return None
+                    
+                    self.logger.info(f"Возобновляем поиск ИНН для {full_name} после ожидания (попытка {current_retry})")
+                    
+                    # Пересоздаем драйвер после сна
+                    try:
+                        # Создаем сервис и драйвер
+                        if sys.platform == 'win32':
+                            # Windows путь
+                            chromedriver_path = os.path.join(os.getcwd(), 'chromedriver.exe')
+                            if not os.path.exists(chromedriver_path):
+                                chromedriver_path = 'C:/chromedriver/chromedriver.exe'
+                        else:
+                            # Linux/Mac путь
+                            chromedriver_path = "./chromedriver"
+                        
+                        self.logger.info(f"Пересоздание драйвера, используется ChromeDriver по пути: {chromedriver_path}")
+                        service = Service(executable_path=chromedriver_path)
+                        self.driver = webdriver.Chrome(service=service, options=self.options)
+                        self.driver.set_page_load_timeout(90)  # Таймаут загрузки страницы (секунды)
+                        self.wait = WebDriverWait(self.driver, 10)  # Таймаут для ожидания элементов (секунды)
+                    except Exception as browser_error:
+                        self.logger.error(f"Не удалось создать браузер после ожидания: {browser_error}")
+                        return None
+                    
+                    # Продолжаем попытку с той же компанией
+                    continue
 
                 # Если мы здесь, значит страница успешно загрузилась
                 if current_retry > 0:
@@ -1496,7 +1572,7 @@ class DadataParser(BaseSiteParser):
                 self.driver.execute_script("arguments[0].scrollIntoView({block: 'center'});", input_field)
                 
                 # Делаем паузу перед вводом
-                await asyncio.sleep(1)
+                await asyncio.sleep(2)
                 
                 # Очищаем поле ввода и вводим ФИО
                 input_field.clear()
@@ -1506,8 +1582,8 @@ class DadataParser(BaseSiteParser):
                 self.logger.info(f"Ожидаем результаты автоподсказки для {full_name}")
                 autocomplete_list = self.wait.until(EC.presence_of_element_located((By.CLASS_NAME, "autocomplete-list")))
                 
-                # Ждем небольшую паузу для полной загрузки списка
-                await asyncio.sleep(2)
+                # Ждем для полной загрузки списка
+                await asyncio.sleep(self.autocomplete_wait_seconds)
                 
                 # Находим все элементы списка
                 list_items = autocomplete_list.find_elements(By.TAG_NAME, "li")
@@ -1516,37 +1592,41 @@ class DadataParser(BaseSiteParser):
                     self.logger.warning(f"Автоподсказки для {full_name} не найдены")
                     return None
                 
-                # Ищем первый ИНН физического лица (12 цифр) среди всех элементов списка
+                # Сначала пытаемся найти ИНН физического лица (12 цифр)
+                found_physical_inn = None
+                found_legal_inn = None
+                
+                # Первый проход - ищем только ИНН физических лиц (12 цифр)
                 for item in list_items:
                     try:
                         # Находим элемент с деталями (содержит ИНН)
                         detail_element = item.find_element(By.CLASS_NAME, "ie_detail")
                         detail_text = detail_element.text
                         
-                        # Сначала ищем ИНН физического лица (12 цифр)
+                        # Ищем ИНН физического лица (12 цифр)
                         inn_match = re.search(r'(\d{12})', detail_text)
                         
                         if inn_match:
-                            inn = inn_match.group(1)
-                            self.logger.info(f"Извлечен ИНН физического лица {inn} для {full_name}")
-                            return inn
+                            found_physical_inn = inn_match.group(1)
+                            self.logger.info(f"Извлечен ИНН физического лица {found_physical_inn} для {full_name}")
+                            return found_physical_inn
                     except Exception as item_e:
                         self.logger.debug(f"Ошибка при обработке элемента списка: {item_e}")
                         continue
                 
-                # Если не нашли ИНН физлица (12 цифр), используем первый доступный ИНН
+                # Второй проход - ищем ИНН юридических лиц (10 цифр), если не нашли физлица
                 for item in list_items:
                     try:
                         detail_element = item.find_element(By.CLASS_NAME, "ie_detail")
                         detail_text = detail_element.text
                         
-                        # Используем регулярное выражение для извлечения любого ИНН (10 или 12 цифр)
-                        inn_match = re.search(r'(\d{10}|\d{12})', detail_text)
+                        # Ищем ИНН юридического лица (10 цифр)
+                        inn_match = re.search(r'(\d{10})', detail_text)
                         
                         if inn_match:
-                            inn = inn_match.group(1)
-                            self.logger.info(f"Извлечен ИНН {inn} для {full_name} (возможно юрлица)")
-                            return inn
+                            found_legal_inn = inn_match.group(1)
+                            self.logger.info(f"Извлечен ИНН юридического лица {found_legal_inn} для {full_name}")
+                            return f"{found_legal_inn} (возможно юрлица)"
                     except Exception:
                         continue
                 
@@ -1554,17 +1634,54 @@ class DadataParser(BaseSiteParser):
                 return None
                 
             except Exception as e:
-                self.logger.error(f"Ошибка при парсинге сайта Райффайзен!")
+                self.logger.error(f"Ошибка при парсинге сайта Райффайзен банка")
                 
                 # Проверяем, связана ли ошибка с доступностью сайта
                 if "ERR_CONNECTION_REFUSED" in str(e) or "ERR_CONNECTION_TIMED_OUT" in str(e) or "ERR_NAME_NOT_RESOLVED" in str(e):
-                    if current_retry < max_retry_attempts:
-                        current_retry += 1
-                        self.logger.warning(f"Проблемы с доступом к сайту. Ожидание 3 минуты (попытка {current_retry}/{max_retry_attempts})...")
-                        await asyncio.sleep(180)  # Ждем 3 минуты
-                        continue
+                    # Устанавливаем глобальный флаг блокировки Райфайзен банка
+                    set_raiffeisen_blocked()
+                    self.logger.warning(f"Установлена глобальная блокировка Райфайзен банка на 30 секунд. Ожидаем...")
+                    
+                    # Закрываем и пересоздаем драйвер перед уходом в сон
+                    self._ensure_browser_closed()
+                    
+                    # Уходим в сон на указанное в конфигурации время
+                    block_time_seconds = int(os.getenv('RAIFFEISEN_BLOCK_TIME_SECONDS', '3600'))
+                    await asyncio.sleep(block_time_seconds)
+                    
+                    # Увеличиваем счетчик попыток
+                    current_retry += 1
+                    if current_retry >= max_retry_attempts:
+                        self.logger.error(f"Превышено максимальное количество попыток ({max_retry_attempts}) для {full_name}")
+                        return None
+                    
+                    self.logger.info(f"Возобновляем поиск ИНН для {full_name} после ожидания (попытка {current_retry})")
+                    
+                    # Пересоздаем драйвер после сна
+                    try:
+                        # Создаем сервис и драйвер
+                        if sys.platform == 'win32':
+                            # Windows путь
+                            chromedriver_path = os.path.join(os.getcwd(), 'chromedriver.exe')
+                            if not os.path.exists(chromedriver_path):
+                                chromedriver_path = 'C:/chromedriver/chromedriver.exe'
+                        else:
+                            # Linux/Mac путь
+                            chromedriver_path = "./chromedriver"
+                        
+                        self.logger.info(f"Пересоздание драйвера, используется ChromeDriver по пути: {chromedriver_path}")
+                        service = Service(executable_path=chromedriver_path)
+                        self.driver = webdriver.Chrome(service=service, options=self.options)
+                        self.driver.set_page_load_timeout(90)  # Таймаут загрузки страницы (секунды)
+                        self.wait = WebDriverWait(self.driver, 10)  # Таймаут для ожидания элементов (секунды)
+                    except Exception as browser_error:
+                        self.logger.error(f"Не удалось создать браузер после ожидания: {browser_error}")
+                        return None
+                    
+                    # Продолжаем попытку с той же компанией
+                    continue
                 
-                # Если это другая ошибка или превышено количество попыток
+                # Если это другая ошибка
                 return None
     
     def _get_data_manager(self) -> Optional[DataManager]:

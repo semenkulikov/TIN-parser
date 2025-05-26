@@ -27,7 +27,7 @@ class CompanyData:
     def __init__(self, name: str, inn: str, ogrn: Optional[str] = None, address: Optional[str] = None, ceo_name: Optional[str] = None, ceo_inn: Optional[str] = None):
         self.name = name
         # Гарантируем, что ИНН хранится как строка, сохраняя ведущие нули
-        self.inn = str(inn).strip()
+        self.inn = str(inn).strip() if inn is not None else None
         self.chairman_name: Optional[str] = None
         self.chairman_inn: Optional[str] = None
         self.source: Optional[str] = None
@@ -46,7 +46,7 @@ class CompanyData:
     def from_dict(cls, data: Dict[str, Any]) -> 'CompanyData':
         """Создает объект CompanyData из словаря"""
         # Сохраняем ИНН как строку
-        inn = str(data["ИНН"]).strip()
+        inn = str(data["ИНН"]).strip() if data.get("ИНН") is not None else None
         company = cls(data["Юридическое название"], inn)
         company.chairman_name = data.get("ФИО Председателя")
         company.chairman_inn = data.get("ИНН Председателя")
@@ -78,7 +78,7 @@ class DataManager:
             
             # Дополнительная обработка для гарантии, что ИНН является строкой и с сохранением ведущих нулей
             if 'ИНН' in df.columns:
-                df['ИНН'] = df['ИНН'].astype(str).str.strip()
+                df['ИНН'] = df['ИНН'].astype(str).str.strip().str.zfill(9)  # Заполняем ведущими нулями до 9 знаков как минимум
                 
             logger.info(f"Успешно загружено {len(df)} записей")
             return df
@@ -90,11 +90,11 @@ class DataManager:
         """Загрузка результатов из CSV файла"""
         if os.path.exists(self.output_file) and os.path.getsize(self.output_file) > 0:
             try:
-                df = pd.read_csv(self.output_file, encoding='utf-8')
+                df = pd.read_csv(self.output_file, encoding='utf-8', dtype={'ИНН': str})
                 loaded_count = 0
                 
                 for _, row in df.iterrows():
-                    inn = str(row['ИНН'])
+                    inn = str(row['ИНН']).strip() if not pd.isna(row['ИНН']) else None
                     
                     # Пропускаем, если ИНН уже в результатах или если нет данных о председателе
                     if inn in self.results:
@@ -130,7 +130,7 @@ class DataManager:
         
         for _, row in df.iterrows():
             # Гарантируем, что ИНН - это строка с сохранением ведущих нулей
-            inn = str(row['ИНН']).strip()
+            inn = str(row['ИНН']).strip() if not pd.isna(row['ИНН']) else None
             
             # Проверяем, был ли уже обработан данный ИНН
             if inn in self.processed_inns:
@@ -231,13 +231,14 @@ class DataManager:
                     
                     # Сначала добавляем все записи из текущих результатов
                     for _, row in results_df.iterrows():
-                        inn = str(row['ИНН']).strip()
-                        merged_data[inn] = row.to_dict()
+                        inn = str(row['ИНН']).strip() if not pd.isna(row['ИНН']) else None
+                        if inn:
+                            merged_data[inn] = row.to_dict()
                     
                     # Затем добавляем записи из существующего файла, если их нет в текущих результатах
                     for _, row in existing_df.iterrows():
-                        inn = str(row['ИНН']).strip()
-                        if inn not in merged_data:
+                        inn = str(row['ИНН']).strip() if not pd.isna(row['ИНН']) else None
+                        if inn and inn not in merged_data:
                             merged_data[inn] = row.to_dict()
                     
                     # Создаем новый DataFrame из объединенных данных
@@ -268,21 +269,22 @@ class DataManager:
             company: Данные о компании
         """
         # Гарантируем, что ИНН хранится как строка с ведущими нулями
-        inn_str = str(company.inn).strip()
+        inn_str = str(company.inn).strip() if company.inn is not None else None
         
         # Обновляем компанию в объекте, если требуется
         company.inn = inn_str
         
         # Сохраняем результат текущего запуска
-        self.runtime_results[inn_str] = company
+        if inn_str:
+            self.runtime_results[inn_str] = company
         
-        # Увеличиваем счетчик обработанных записей
-        self.save_results_counter += 1
+            # Увеличиваем счетчик обработанных записей
+            self.save_results_counter += 1
         
-        # Если достигнут интервал сохранения - сохраняем в кэш
-        if self.save_results_counter >= self.save_interval:
-            logger.info(f"Достигнут интервал сохранения ({self.save_interval}), сохраняем промежуточные результаты")
-            self.save_results(force=False)
+            # Если достигнут интервал сохранения - сохраняем в кэш
+            if self.save_results_counter >= self.save_interval:
+                logger.info(f"Достигнут интервал сохранения ({self.save_interval}), сохраняем промежуточные результаты")
+                self.save_results(force=False)
     
     def _load_cache(self) -> None:
         """Загрузка кэша обработанных ИНН"""
@@ -291,14 +293,15 @@ class DataManager:
                 with open(self.cache_file, 'r', encoding='utf-8') as f:
                     cache_data = json.load(f)
                     # Преобразуем все ИНН в списке в строки, сохраняя ведущие нули
-                    self.processed_inns = set(str(inn).strip() for inn in cache_data.get('processed_inns', []))
+                    self.processed_inns = set(str(inn).strip() for inn in cache_data.get('processed_inns', []) if inn is not None)
                     
                     # Загрузка результатов, если они есть
                     if 'results' in cache_data:
                         for data in cache_data['results']:
                             try:
                                 company = CompanyData.from_dict(data)
-                                self.results[company.inn] = company
+                                if company.inn:
+                                    self.results[company.inn] = company
                             except Exception as e:
                                 logger.warning(f"Не удалось загрузить данные компании из кэша: {e}")
                             
@@ -323,11 +326,12 @@ class DataManager:
             
             # Обновляем результаты из текущего запуска
             for inn, company in self.runtime_results.items():
-                self.results[str(inn).strip()] = company
-                self.processed_inns.add(str(inn).strip())
+                if inn:
+                    self.results[str(inn).strip()] = company
+                    self.processed_inns.add(str(inn).strip())
             
             # Конвертируем все ИНН в строки для сохранения ведущих нулей
-            inns_list = [str(inn).strip() for inn in self.processed_inns]
+            inns_list = [str(inn).strip() for inn in self.processed_inns if inn is not None]
             
             cache_data = {
                 'processed_inns': inns_list,

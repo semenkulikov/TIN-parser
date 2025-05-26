@@ -15,7 +15,9 @@ from site_parsers import (
     DadataParser
 )
 from dotenv import load_dotenv
+import threading
 
+# Загрузка переменных окружения из .env файла
 load_dotenv()
 
 # Настройка логирования
@@ -27,6 +29,17 @@ data_manager = None
 is_saving = False
 # Флаг для обозначения, что программа завершается
 is_exiting = False
+# Блокировка для контроля доступа к Райфайзен банку
+raiffeisen_lock = threading.Lock()
+# Флаг блокировки Райфайзен
+raiffeisen_blocked = False
+# Время последней блокировки
+raiffeisen_block_time = 0
+
+# Загрузка конфигурационных параметров из .env
+RAIFFEISEN_BLOCK_TIME_SECONDS = int(os.getenv('RAIFFEISEN_BLOCK_TIME_SECONDS', '3600'))
+RAIFFEISEN_SECONDARY_WAIT_SECONDS = int(os.getenv('RAIFFEISEN_SECONDARY_WAIT_SECONDS', '600'))
+SAVE_INTERVAL = int(os.getenv('SAVE_INTERVAL', '50'))
 
 # Функция для загрузки API ключей из переменных окружения
 def load_api_keys(env_prefix):
@@ -54,6 +67,54 @@ def load_api_keys(env_prefix):
     
     logger.info(f"Загружено {len(keys)} ключей с префиксом {env_prefix}")
     return keys
+
+# Функция для проверки, не заблокирован ли Райфайзен банк
+def is_raiffeisen_blocked():
+    """
+    Проверяет, находится ли сайт Райфайзен в состоянии блокировки.
+    Если с момента блокировки прошло более часа, снимает блокировку.
+    
+    :return: True, если сайт заблокирован, False в противном случае
+    """
+    global raiffeisen_blocked, raiffeisen_block_time
+    
+    with raiffeisen_lock:
+        if not raiffeisen_blocked:
+            return False
+        
+        # Проверяем, не прошло ли время блокировки
+        current_time = time.time()
+        if current_time - raiffeisen_block_time >= RAIFFEISEN_BLOCK_TIME_SECONDS:
+            logger.info("Время блокировки Райфайзен банка истекло, снимаем блокировку")
+            raiffeisen_blocked = False
+            return False
+            
+        # Вычисляем, сколько времени осталось до конца блокировки
+        remaining_time = int((raiffeisen_block_time + RAIFFEISEN_BLOCK_TIME_SECONDS - current_time) / 60)  # в минутах
+        logger.debug(f"Райфайзен банк заблокирован еще {remaining_time} минут")
+        return True
+
+# Функция для установки блокировки Райфайзен банка
+def set_raiffeisen_blocked():
+    """
+    Устанавливает флаг блокировки сайта Райфайзен и сохраняет время блокировки
+    """
+    global raiffeisen_blocked, raiffeisen_block_time
+    
+    with raiffeisen_lock:
+        # Устанавливаем блокировку, только если она еще не установлена или прошло больше 10 минут
+        current_time = time.time()
+        if not raiffeisen_blocked or (current_time - raiffeisen_block_time > RAIFFEISEN_SECONDARY_WAIT_SECONDS):
+            raiffeisen_blocked = True
+            raiffeisen_block_time = current_time
+            logger.warning(f"Установлена блокировка для Райфайзен банка на {RAIFFEISEN_BLOCK_TIME_SECONDS // 60} минут")
+        else:
+            # Если блокировка уже установлена, выводим информацию о времени ожидания
+            remaining_time = int((raiffeisen_block_time + RAIFFEISEN_BLOCK_TIME_SECONDS - current_time) / 60)  # в минутах
+            logger.debug(f"Райфайзен банк уже заблокирован, осталось ждать {remaining_time} минут")
+
+# Экспортируем эти функции для использования в других модулях
+__all__ = ['is_raiffeisen_blocked', 'set_raiffeisen_blocked']
 
 # Функция для форсированного сохранения при любом завершении
 @atexit.register
@@ -134,17 +195,13 @@ async def main():
     logger.info(f"Запуск парсера с входным файлом: {input_file}, выходным файлом: {output_file}")
     
     try:
-        # Инициализация менеджера данных (с сохранением каждых 50 записей)
-        data_manager = DataManager(input_file, output_file, save_interval=50)
+        # Инициализация менеджера данных с интервалом сохранения из конфигурации
+        data_manager = DataManager(input_file, output_file, save_interval=SAVE_INTERVAL)
         
         # Инициализация менеджера парсеров
         parser_manager = ParserManager(data_manager)
         
-        # Добавление парсера Dadata с поддержкой множественных API ключей
-        # Загружаем ключи Dadata из переменных окружения
-        dadata_token = os.getenv('DADATA_TOKEN')
-        
-        # Загружаем ключи для Dadata (FNS больше не используется, т.к. ИНН получаем через сайт)
+        # Загружаем ключи для Dadata
         dadata_keys = load_api_keys('DADATA_TOKEN')
         
         # Настраиваем максимальное количество параллельных процессов в зависимости от числа ключей
@@ -152,20 +209,28 @@ async def main():
         parser_manager.max_workers = max_workers
         logger.info(f"Установлено максимальное количество параллельных процессов: {max_workers}")
         
-        # Добавляем парсер только если есть хотя бы один ключ Dadata
+        # Добавляем парсеры с параметрами из .env
         if dadata_keys:
             # Используем только первый ключ из списка для передачи в конструктор
             # Остальные ключи будут загружены автоматически из переменных окружения
-            parser_manager.add_parser(DadataParser(token=dadata_keys[0], rate_limit=0.2))
+            dadata_rate_limit = float(os.getenv('DADATA_RATE_LIMIT', '0.2'))
+            parser_manager.add_parser(DadataParser(token=dadata_keys[0], rate_limit=dadata_rate_limit))
         else:
             logger.warning("Переменные окружения для DADATA_TOKEN не заданы, парсер Dadata не будет использоваться")
-            
-        # Добавляем стандартные парсеры
-        # parser_manager.add_parser(FocusKonturParser(rate_limit=5.0))
-        # parser_manager.add_parser(CheckoParser(rate_limit=2.0))
-        # parser_manager.add_parser(ZaChestnyiBiznesParser(rate_limit=3.0))
-        # parser_manager.add_parser(AuditItParser(rate_limit=2.0))
-        # parser_manager.add_parser(RbcCompaniesParser(rate_limit=2.0))
+        
+        # Добавляем стандартные парсеры (закомментированы для текущего использования)
+        # Параметры взяты из .env файла
+        # focus_rate_limit = float(os.getenv('FOCUS_KONTUR_RATE_LIMIT', '5.0'))
+        # checko_rate_limit = float(os.getenv('CHECKO_RATE_LIMIT', '2.0'))
+        # zachestny_rate_limit = float(os.getenv('ZACHESTNY_RATE_LIMIT', '3.0'))
+        # audit_it_rate_limit = float(os.getenv('AUDIT_IT_RATE_LIMIT', '2.0'))
+        # rbc_rate_limit = float(os.getenv('RBC_RATE_LIMIT', '2.0'))
+        
+        # parser_manager.add_parser(FocusKonturParser(rate_limit=focus_rate_limit))
+        # parser_manager.add_parser(CheckoParser(rate_limit=checko_rate_limit))
+        # parser_manager.add_parser(ZaChestnyiBiznesParser(rate_limit=zachestny_rate_limit))
+        # parser_manager.add_parser(AuditItParser(rate_limit=audit_it_rate_limit))
+        # parser_manager.add_parser(RbcCompaniesParser(rate_limit=rbc_rate_limit))
         
         # Запуск процесса парсинга
         start_time = time.time()
@@ -182,7 +247,10 @@ async def main():
         # Закрываем все процессы хрома через os.system
         logger.info("Закрываем все процессы хрома...")
         try:
-            os.system("taskkill /f /im chrome.exe")
+            if sys.platform == 'win32':
+                os.system("taskkill /f /im chrome.exe")
+            else:
+                os.system("pkill -f chrome")
             logger.info("Все процессы хрома успешно закрыты")
         except Exception as e:
             logger.error(f"Ошибка при закрытии процессов хрома: {e}")
