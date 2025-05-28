@@ -1,3 +1,4 @@
+import threading
 import aiohttp
 import asyncio
 import logging
@@ -22,16 +23,73 @@ from parser_base import BaseSiteParser, CompanyData, DataManager
 # import undetected_chromedriver as uc
 from dadata import Dadata, DadataAsync
 
-# Импорт глобальных флагов блокировки из main.py
-try:
-    from main import is_raiffeisen_blocked, set_raiffeisen_blocked
-except ImportError:
-    # Создаем заглушки, если функции недоступны
-    def is_raiffeisen_blocked():
-        return False
+from dotenv import load_dotenv, find_dotenv
+
+# Загрузка переменных окружения из .env файла
+if find_dotenv():
+    here = os.path.dirname(os.path.abspath(__file__))
+    load_dotenv(os.path.join(here, '.env'), override=True)
+
+# Настройка логирования
+logger = logging.getLogger("TIN_Parser.site_parsers")
+
+# Загрузка конфигурационных параметров из .env
+RAIFFEISEN_BLOCK_TIME_SECONDS = int(os.getenv('RAIFFEISEN_BLOCK_TIME_SECONDS', '3600'))
+RAIFFEISEN_SECONDARY_WAIT_SECONDS = int(os.getenv('RAIFFEISEN_SECONDARY_WAIT_SECONDS', '600'))
+RAIFFEISEN_MAX_RETRY_ATTEMPTS = int(os.getenv('RAIFFEISEN_MAX_RETRY_ATTEMPTS', '24'))
+
+# Блокировка для контроля доступа к Райфайзен банку
+raiffeisen_lock = threading.Lock()
+# Флаг блокировки Райфайзен
+raiffeisen_blocked = False
+# Время последней блокировки
+raiffeisen_block_time = 0
+
+
+# Функция для проверки, не заблокирован ли Райфайзен банк
+def is_raiffeisen_blocked():
+    """
+    Проверяет, находится ли сайт Райфайзен в состоянии блокировки.
+    Если с момента блокировки прошло более часа, снимает блокировку.
     
-    def set_raiffeisen_blocked():
-        pass
+    :return: True, если сайт заблокирован, False в противном случае
+    """
+    global raiffeisen_blocked, raiffeisen_block_time
+    
+    with raiffeisen_lock:
+        if not raiffeisen_blocked:
+            return False
+        
+        # Проверяем, не прошло ли время блокировки
+        current_time = time.time()
+        if current_time - raiffeisen_block_time >= RAIFFEISEN_BLOCK_TIME_SECONDS:
+            logger.info("Время блокировки Райфайзен банка истекло, снимаем блокировку")
+            raiffeisen_blocked = False
+            return False
+            
+        # Вычисляем, сколько времени осталось до конца блокировки
+        remaining_time = int((raiffeisen_block_time + RAIFFEISEN_BLOCK_TIME_SECONDS - current_time) / 60)  # в минутах
+        logger.info(f"Райфайзен банк заблокирован еще {remaining_time} минут")
+        return True
+
+# Функция для установки блокировки Райфайзен банка
+def set_raiffeisen_blocked():
+    """
+    Устанавливает флаг блокировки сайта Райфайзен и сохраняет время блокировки
+    """
+    global raiffeisen_blocked, raiffeisen_block_time
+    
+    with raiffeisen_lock:
+        # Устанавливаем блокировку, только если она еще не установлена или прошло больше 10 минут
+        current_time = time.time()
+        if not raiffeisen_blocked or (current_time - raiffeisen_block_time > RAIFFEISEN_SECONDARY_WAIT_SECONDS):
+            raiffeisen_blocked = True
+            raiffeisen_block_time = current_time
+            logger.warning(f"Установлена блокировка для Райфайзен банка на {RAIFFEISEN_BLOCK_TIME_SECONDS // 60} минут")
+        else:
+            # Если блокировка уже установлена, выводим информацию о времени ожидания
+            remaining_time = int((raiffeisen_block_time + RAIFFEISEN_BLOCK_TIME_SECONDS - current_time) / 60)  # в минутах
+            logger.info(f"Райфайзен банк уже заблокирован, осталось ждать {remaining_time} минут")
 
 class KeyRotator:
     """Класс для ротации API ключей"""
@@ -1475,77 +1533,25 @@ class DadataParser(BaseSiteParser):
         """
         self.logger.info(f"Поиск ИНН для {full_name} через сайт Райффайзен банка")
         
-        # Проверяем глобальный флаг блокировки перед попыткой доступа
-        if is_raiffeisen_blocked():
-            self.logger.warning(f"Сайт Райфайзен банка заблокирован. Ожидаем перед повторной попыткой для {full_name}")
-            # Получаем время блокировки из .env
-            block_time_seconds = int(os.getenv('RAIFFEISEN_BLOCK_TIME_SECONDS', '3600'))
-            
-            # Уходим в сон на указанное время
-            await asyncio.sleep(block_time_seconds)
-            
-            self.logger.info(f"Возобновляем поиск ИНН для {full_name} после ожидания")
-            # После сна проверяем снова - если сайт все еще заблокирован, делаем дополнительную паузу
-            if is_raiffeisen_blocked():
-                secondary_wait = int(os.getenv('RAIFFEISEN_SECONDARY_WAIT_SECONDS', '600'))
-                self.logger.warning(f"Сайт Райфайзен банка все еще заблокирован после ожидания. Ждем еще {secondary_wait} секунд")
-                await asyncio.sleep(secondary_wait)
-        
         # Максимальное число попыток восстановления после бана
         max_retry_attempts = self.raiffeisen_max_retry_attempts
         current_retry = 0
         
-        while True:
+        while current_retry < max_retry_attempts:
             try:
+                # Проверяем глобальный флаг блокировки перед каждой попыткой
+                if is_raiffeisen_blocked():
+                    self.logger.warning(f"Сайт Райфайзен банка заблокирован. Ожидаем перед повторной попыткой для {full_name}")
+                    # Ожидаем снятия блокировки
+                    await asyncio.sleep(RAIFFEISEN_SECONDARY_WAIT_SECONDS)
+                    # Проверяем снова
+                    if is_raiffeisen_blocked():
+                        self.logger.warning(f"Блокировка все еще активна. Попытка {current_retry}/{max_retry_attempts}")
+                        continue
+                
                 # Загрузка страницы
-                self.logger.info("Открываем сайт reg-raiffeisen.ru")
-                try:
-                    self.driver.get("https://reg-raiffeisen.ru/")
-                except Exception as e:
-                    self.logger.error(f"Не удалось загрузить сайт")
-                    
-                    # Устанавливаем глобальный флаг блокировки Райфайзен банка
-                    set_raiffeisen_blocked()
-                    self.logger.warning(f"Установлена глобальная блокировка Райфайзен банка на 1 час. Ожидаем...")
-                    
-                    # Закрываем и пересоздаем драйвер перед уходом в сон
-                    self._ensure_browser_closed()
-                    
-                    # Уходим в сон на указанное в конфигурации время
-                    block_time_seconds = int(os.getenv('RAIFFEISEN_BLOCK_TIME_SECONDS', '3600'))
-                    await asyncio.sleep(block_time_seconds)
-                    
-                    # Увеличиваем счетчик попыток
-                    current_retry += 1
-                    if current_retry >= max_retry_attempts:
-                        self.logger.error(f"Превышено максимальное количество попыток ({max_retry_attempts}) для {full_name}")
-                        return None
-                    
-                    self.logger.info(f"Возобновляем поиск ИНН для {full_name} после ожидания (попытка {current_retry})")
-                    
-                    # Пересоздаем драйвер после сна
-                    try:
-                        # Создаем сервис и драйвер
-                        if sys.platform == 'win32':
-                            # Windows путь
-                            chromedriver_path = os.path.join(os.getcwd(), 'chromedriver.exe')
-                            if not os.path.exists(chromedriver_path):
-                                chromedriver_path = 'C:/chromedriver/chromedriver.exe'
-                        else:
-                            # Linux/Mac путь
-                            chromedriver_path = "./chromedriver"
-                        
-                        self.logger.info(f"Пересоздание драйвера, используется ChromeDriver по пути: {chromedriver_path}")
-                        service = Service(executable_path=chromedriver_path)
-                        self.driver = webdriver.Chrome(service=service, options=self.options)
-                        self.driver.set_page_load_timeout(90)  # Таймаут загрузки страницы (секунды)
-                        self.wait = WebDriverWait(self.driver, 10)  # Таймаут для ожидания элементов (секунды)
-                    except Exception as browser_error:
-                        self.logger.error(f"Не удалось создать браузер после ожидания: {browser_error}")
-                        return None
-                    
-                    # Продолжаем попытку с той же компанией
-                    continue
+                self.logger.info(f"Открываем сайт reg-raiffeisen.ru (Поиск для {full_name})")
+                self.driver.get("https://reg-raiffeisen.ru/")
 
                 # Если мы здесь, значит страница успешно загрузилась
                 if current_retry > 0:
@@ -1636,53 +1642,47 @@ class DadataParser(BaseSiteParser):
             except Exception as e:
                 self.logger.error(f"Ошибка при парсинге сайта Райффайзен банка")
                 
-                # Проверяем, связана ли ошибка с доступностью сайта
-                if "ERR_CONNECTION_REFUSED" in str(e) or "ERR_CONNECTION_TIMED_OUT" in str(e) or "ERR_NAME_NOT_RESOLVED" in str(e):
-                    # Устанавливаем глобальный флаг блокировки Райфайзен банка
-                    set_raiffeisen_blocked()
-                    self.logger.warning(f"Установлена глобальная блокировка Райфайзен банка на 30 секунд. Ожидаем...")
-                    
-                    # Закрываем и пересоздаем драйвер перед уходом в сон
-                    self._ensure_browser_closed()
-                    
-                    # Уходим в сон на указанное в конфигурации время
-                    block_time_seconds = int(os.getenv('RAIFFEISEN_BLOCK_TIME_SECONDS', '3600'))
-                    await asyncio.sleep(block_time_seconds)
-                    
-                    # Увеличиваем счетчик попыток
-                    current_retry += 1
-                    if current_retry >= max_retry_attempts:
-                        self.logger.error(f"Превышено максимальное количество попыток ({max_retry_attempts}) для {full_name}")
-                        return None
-                    
-                    self.logger.info(f"Возобновляем поиск ИНН для {full_name} после ожидания (попытка {current_retry})")
-                    
-                    # Пересоздаем драйвер после сна
-                    try:
-                        # Создаем сервис и драйвер
-                        if sys.platform == 'win32':
-                            # Windows путь
-                            chromedriver_path = os.path.join(os.getcwd(), 'chromedriver.exe')
-                            if not os.path.exists(chromedriver_path):
-                                chromedriver_path = 'C:/chromedriver/chromedriver.exe'
-                        else:
-                            # Linux/Mac путь
-                            chromedriver_path = "./chromedriver"
-                        
-                        self.logger.info(f"Пересоздание драйвера, используется ChromeDriver по пути: {chromedriver_path}")
-                        service = Service(executable_path=chromedriver_path)
-                        self.driver = webdriver.Chrome(service=service, options=self.options)
-                        self.driver.set_page_load_timeout(90)  # Таймаут загрузки страницы (секунды)
-                        self.wait = WebDriverWait(self.driver, 10)  # Таймаут для ожидания элементов (секунды)
-                    except Exception as browser_error:
-                        self.logger.error(f"Не удалось создать браузер после ожидания: {browser_error}")
-                        return None
-                    
-                    # Продолжаем попытку с той же компанией
-                    continue
+                # Устанавливаем глобальный флаг блокировки Райфайзен банка
+                set_raiffeisen_blocked()
+                self.logger.warning(f"Установлена глобальная блокировка Райфайзен банка. Ожидаем...")
                 
-                # Если это другая ошибка
-                return None
+                # Закрываем и пересоздаем драйвер перед уходом в сон
+                self._ensure_browser_closed()
+                
+                # Увеличиваем счетчик попыток
+                current_retry += 1
+                if current_retry >= max_retry_attempts:
+                    self.logger.error(f"Превышено максимальное количество попыток ({max_retry_attempts}) для {full_name}")
+                    return None
+                
+                # Пересоздаем драйвер после ошибки
+                try:
+                    # Создаем сервис и драйвер
+                    if sys.platform == 'win32':
+                        # Windows путь
+                        chromedriver_path = os.path.join(os.getcwd(), 'chromedriver.exe')
+                        if not os.path.exists(chromedriver_path):
+                            chromedriver_path = 'C:/chromedriver/chromedriver.exe'
+                    else:
+                        # Linux/Mac путь
+                        chromedriver_path = "./chromedriver"
+                    
+                    self.logger.info(f"Пересоздание драйвера, используется ChromeDriver по пути: {chromedriver_path}")
+                    service = Service(executable_path=chromedriver_path)
+                    self.driver = webdriver.Chrome(service=service, options=self.options)
+                    self.driver.set_page_load_timeout(self.page_load_timeout)
+                    self.wait = WebDriverWait(self.driver, self.element_wait_timeout)
+                except Exception as browser_error:
+                    self.logger.error(f"Не удалось создать браузер после ошибки: {browser_error}")
+                    return None
+                
+                # Продолжаем попытку с той же компанией
+                continue
+            
+        
+        # Если исчерпали все попытки
+        self.logger.error(f"Превышено максимальное количество попыток ({max_retry_attempts}) для {full_name}")
+        return None
     
     def _get_data_manager(self) -> Optional[DataManager]:
         """

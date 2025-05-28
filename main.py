@@ -15,10 +15,10 @@ from site_parsers import (
     DadataParser
 )
 from dotenv import load_dotenv
-import threading
 
 # Загрузка переменных окружения из .env файла
-load_dotenv()
+here = os.path.dirname(os.path.abspath(__file__))
+load_dotenv(os.path.join(here, '.env'), override=True)
 
 # Настройка логирования
 logger = logging.getLogger("TIN_Parser.Main")
@@ -29,17 +29,8 @@ data_manager = None
 is_saving = False
 # Флаг для обозначения, что программа завершается
 is_exiting = False
-# Блокировка для контроля доступа к Райфайзен банку
-raiffeisen_lock = threading.Lock()
-# Флаг блокировки Райфайзен
-raiffeisen_blocked = False
-# Время последней блокировки
-raiffeisen_block_time = 0
-
-# Загрузка конфигурационных параметров из .env
-RAIFFEISEN_BLOCK_TIME_SECONDS = int(os.getenv('RAIFFEISEN_BLOCK_TIME_SECONDS', '3600'))
-RAIFFEISEN_SECONDARY_WAIT_SECONDS = int(os.getenv('RAIFFEISEN_SECONDARY_WAIT_SECONDS', '600'))
 SAVE_INTERVAL = int(os.getenv('SAVE_INTERVAL', '50'))
+
 
 # Функция для загрузки API ключей из переменных окружения
 def load_api_keys(env_prefix):
@@ -68,53 +59,7 @@ def load_api_keys(env_prefix):
     logger.info(f"Загружено {len(keys)} ключей с префиксом {env_prefix}")
     return keys
 
-# Функция для проверки, не заблокирован ли Райфайзен банк
-def is_raiffeisen_blocked():
-    """
-    Проверяет, находится ли сайт Райфайзен в состоянии блокировки.
-    Если с момента блокировки прошло более часа, снимает блокировку.
-    
-    :return: True, если сайт заблокирован, False в противном случае
-    """
-    global raiffeisen_blocked, raiffeisen_block_time
-    
-    with raiffeisen_lock:
-        if not raiffeisen_blocked:
-            return False
-        
-        # Проверяем, не прошло ли время блокировки
-        current_time = time.time()
-        if current_time - raiffeisen_block_time >= RAIFFEISEN_BLOCK_TIME_SECONDS:
-            logger.info("Время блокировки Райфайзен банка истекло, снимаем блокировку")
-            raiffeisen_blocked = False
-            return False
-            
-        # Вычисляем, сколько времени осталось до конца блокировки
-        remaining_time = int((raiffeisen_block_time + RAIFFEISEN_BLOCK_TIME_SECONDS - current_time) / 60)  # в минутах
-        logger.debug(f"Райфайзен банк заблокирован еще {remaining_time} минут")
-        return True
 
-# Функция для установки блокировки Райфайзен банка
-def set_raiffeisen_blocked():
-    """
-    Устанавливает флаг блокировки сайта Райфайзен и сохраняет время блокировки
-    """
-    global raiffeisen_blocked, raiffeisen_block_time
-    
-    with raiffeisen_lock:
-        # Устанавливаем блокировку, только если она еще не установлена или прошло больше 10 минут
-        current_time = time.time()
-        if not raiffeisen_blocked or (current_time - raiffeisen_block_time > RAIFFEISEN_SECONDARY_WAIT_SECONDS):
-            raiffeisen_blocked = True
-            raiffeisen_block_time = current_time
-            logger.warning(f"Установлена блокировка для Райфайзен банка на {RAIFFEISEN_BLOCK_TIME_SECONDS // 60} минут")
-        else:
-            # Если блокировка уже установлена, выводим информацию о времени ожидания
-            remaining_time = int((raiffeisen_block_time + RAIFFEISEN_BLOCK_TIME_SECONDS - current_time) / 60)  # в минутах
-            logger.debug(f"Райфайзен банк уже заблокирован, осталось ждать {remaining_time} минут")
-
-# Экспортируем эти функции для использования в других модулях
-__all__ = ['is_raiffeisen_blocked', 'set_raiffeisen_blocked']
 
 # Функция для форсированного сохранения при любом завершении
 @atexit.register
