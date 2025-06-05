@@ -149,30 +149,47 @@ async def main():
         # Загружаем ключи для Dadata
         dadata_keys = load_api_keys('DADATA_TOKEN')
         
+        # Загружаем ключи для Checko
+        checko_keys = load_api_keys('CHECKO_TOKEN')
+        
         # Настраиваем максимальное количество параллельных процессов в зависимости от числа ключей
-        max_workers = min(len(dadata_keys), 5) if dadata_keys else 1
+        # max_workers = min(len(dadata_keys) + len(checko_keys), 5) if (dadata_keys or checko_keys) else 1
+        
+        # Ограничиваем количество параллельных процессов до 1 для каждого типа ключа
+        # Так как лимит Checko - 100 запросов в сутки на ключ, не имеет смысла
+        # запускать несколько параллельных процессов с одним ключом
+        max_workers = 1
         parser_manager.max_workers = max_workers
-        logger.info(f"Установлено максимальное количество параллельных процессов: {max_workers}")
+        logger.info(f"Установлено максимальное количество параллельных процессов: {max_workers} для сохранения лимита API-запросов")
         
         # Добавляем парсеры с параметрами из .env
         if dadata_keys:
             # Используем только первый ключ из списка для передачи в конструктор
             # Остальные ключи будут загружены автоматически из переменных окружения
             dadata_rate_limit = float(os.getenv('DADATA_RATE_LIMIT', '0.2'))
-            parser_manager.add_parser(DadataParser(token=dadata_keys[0], rate_limit=dadata_rate_limit))
+            # parser_manager.add_parser(DadataParser(token=dadata_keys[0], rate_limit=dadata_rate_limit))
         else:
             logger.warning("Переменные окружения для DADATA_TOKEN не заданы, парсер Dadata не будет использоваться")
         
         # Добавляем стандартные парсеры (закомментированы для текущего использования)
         # Параметры взяты из .env файла
         # focus_rate_limit = float(os.getenv('FOCUS_KONTUR_RATE_LIMIT', '5.0'))
-        # checko_rate_limit = float(os.getenv('CHECKO_RATE_LIMIT', '2.0'))
+        checko_rate_limit = float(os.getenv('CHECKO_RATE_LIMIT', '2.0'))
         # zachestny_rate_limit = float(os.getenv('ZACHESTNY_RATE_LIMIT', '3.0'))
         # audit_it_rate_limit = float(os.getenv('AUDIT_IT_RATE_LIMIT', '2.0'))
         # rbc_rate_limit = float(os.getenv('RBC_RATE_LIMIT', '2.0'))
         
         # parser_manager.add_parser(FocusKonturParser(rate_limit=focus_rate_limit))
-        # parser_manager.add_parser(CheckoParser(rate_limit=checko_rate_limit))
+        
+        # Добавляем парсер CheckoParser с API ключом, если он есть
+        if checko_keys:
+            parser_manager.add_parser(CheckoParser(token=checko_keys[0], rate_limit=checko_rate_limit))
+            logger.info(f"Добавлен парсер CheckoParser с API ключом")
+        else:
+            # Если ключи отсутствуют, сообщаем об ошибке - парсер требует API ключ
+            logger.error("Переменные окружения для CHECKO_TOKEN не заданы. Парсер Checko требует API ключ для работы!")
+            logger.error("Добавьте ключ API в файл .env: CHECKO_TOKEN=ваш_ключ_api")
+            
         # parser_manager.add_parser(ZaChestnyiBiznesParser(rate_limit=zachestny_rate_limit))
         # parser_manager.add_parser(AuditItParser(rate_limit=audit_it_rate_limit))
         # parser_manager.add_parser(RbcCompaniesParser(rate_limit=rbc_rate_limit))

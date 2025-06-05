@@ -45,6 +45,13 @@ raiffeisen_blocked = False
 # Время последней блокировки
 raiffeisen_block_time = 0
 
+# Кастомное исключение для лимита API
+class ApiLimitExceeded(Exception):
+    """Исключение, возникающее при превышении лимита API запросов"""
+    def __init__(self, message="Превышен дневной лимит API запросов"):
+        self.message = message
+        super().__init__(self.message)
+
 
 # Функция для проверки, не заблокирован ли Райфайзен банк
 def is_raiffeisen_blocked():
@@ -538,87 +545,319 @@ class FocusKonturParser(BaseSiteParser):
                 self.wait = None
 
 class CheckoParser(BaseSiteParser):
-    """Парсер для сайта checko.ru"""
+    """Парсер для сайта checko.ru с использованием API"""
     
-    def __init__(self, rate_limit: float = 2.0):
+    def __init__(self, token: str = None, rate_limit: float = 2.0):
+        """
+        Инициализация клиента Checko.ru
+        
+        :param token: API ключ для доступа к сервису checko.ru
+        :param rate_limit: Задержка между запросами (по умолчанию 2.0 секунды)
+        """
         super().__init__("checko.ru", rate_limit)
-        self.search_url = "https://checko.ru/search"
-        self.company_url = "https://checko.ru/company"
+        
+        # Инициализация ротаторов ключей
+        checko_keys = self._load_api_keys_from_env('CHECKO_TOKEN')
+        if token and token not in checko_keys:
+            checko_keys.insert(0, token)
+            
+        self.checko_keys = KeyRotator(checko_keys, "checko.ru")
+        
+        # API URLs
+        self.api_url = "https://api.checko.ru/v2/company"
+        
+        # Счетчик использованных запросов API (лимит - 100 запросов в сутки)
+        self.api_requests_count = 0
+        self.api_daily_limit = 100
+        
+        # Загружаем информацию о запросах API из кеша, если она есть
+        self._load_api_requests_counter()
+        
+        # Устанавливаем headers для запросов
+        self.headers = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36",
+            "Accept": "application/json",
+        }
+    
+    def _load_api_keys_from_env(self, env_prefix: str) -> List[str]:
+        """
+        Загружает API ключи из переменных окружения с указанным префиксом
+        
+        :param env_prefix: Префикс для переменных окружения (например, 'CHECKO_TOKEN')
+        :return: Список найденных ключей
+        """
+        keys = []
+        # Ищем основной ключ
+        main_key = os.getenv(env_prefix)
+        if main_key:
+            keys.append(main_key)
+        
+        # Ищем дополнительные ключи с номерами (CHECKO_TOKEN_1, CHECKO_TOKEN_2, и т.д.)
+        i = 1
+        while True:
+            key = os.getenv(f"{env_prefix}_{i}")
+            if not key:
+                break
+            keys.append(key)
+            i += 1
+        
+        self.logger.info(f"Загружено {len(keys)} ключей с префиксом {env_prefix}")
+        return keys
+    
+    async def parse_companies(self, companies: List[CompanyData]) -> List[CompanyData]:
+        """Парсит список компаний через API checko.ru"""
+        results = []
+        self.logger.info(f"Начинаем обработку {len(companies)} компаний через API Checko.ru")
+        
+        # Получаем ссылку на data_manager для обновления результатов
+        data_manager = self._get_data_manager()
+        
+        # Проверяем доступность API ключей
+        if self.checko_keys.is_empty():
+            self.logger.error("Нет доступных API ключей Checko. Проверьте настройки в .env файле.")
+            return results
+            
+        # Проверяем оставшийся лимит запросов
+        remaining_limit = self.api_daily_limit - self.api_requests_count
+        self.logger.info(f"Доступно {remaining_limit} из {self.api_daily_limit} API запросов Checko на сегодня")
+        
+        if remaining_limit <= 0:
+            self.logger.warning(f"Дневной лимит API запросов ({self.api_daily_limit}) исчерпан. Прерываем обработку.")
+            return results
+        
+        # Обработка всех компаний
+        for i, company in enumerate(companies):
+            try:
+                # Проверяем на прерывание программы перед каждой компанией
+                try:
+                    # Используем asyncio.sleep с очень маленьким таймаутом для проверки прерываний
+                    await asyncio.sleep(0.01)
+                except asyncio.CancelledError:
+                    self.logger.info("Обнаружено прерывание, останавливаем парсинг")
+                    break
+                
+                self.logger.info(f"[{i+1}/{len(companies)}] Обработка компании: {company.name} (ИНН: {company.inn})")
+                
+                # Соблюдаем задержку между запросами
+                await asyncio.sleep(self.rate_limit)
+                
+                # Парсим информацию о компании
+                try:
+                    result = await self.parse_company(company)
+                    if result:
+                        result.source = self.site_name
+                        results.append(result)
+                        self.logger.info(f"Успешно получены данные для {company.name}")
+                        
+                        # Обновляем результаты в data_manager если он доступен
+                        if data_manager:
+                            data_manager.update_results(result)
+                    else:
+                        self.logger.warning(f"Не удалось получить данные для {company.name}")
+                except ApiLimitExceeded as e:
+                    self.logger.warning(f"{e.message}. Прерываем дальнейшую обработку.")
+                    # Сохраняем уже полученные результаты и завершаем работу
+                    break
+                    
+            except Exception as e:
+                self.logger.error(f"Ошибка при обработке компании {company.name}: {e}")
+        
+        # Выводим статистику по использованным запросам API
+        used_requests = self.api_requests_count
+        remaining_limit = max(0, self.api_daily_limit - used_requests)
+        self.logger.info(f"Завершена обработка компаний через API Checko.ru, использовано {used_requests} запросов, осталось {remaining_limit}")
+        self.logger.info(f"Успешно обработано: {len(results)} из {len(companies)} компаний")
+        
+        return results
     
     async def parse_company(self, company: CompanyData) -> Optional[CompanyData]:
-        """Парсит информацию о председателе компании с сайта checko.ru"""
-        max_attempts = 3
+        """
+        Получает информацию о руководителе компании через API checko.ru
         
-        for attempt in range(max_attempts):
-            try:
-                # Формируем URL для поиска по ИНН
-                params = {
-                    'q': company.inn
-                }
-                
-                async with aiohttp.ClientSession() as session:
-                    # Выполняем поисковый запрос
-                    async with session.get(self.search_url, params=params, headers=self.headers) as response:
-                        if response.status != 200:
-                            self.logger.warning(f"Ошибка при поиске компании {company.inn}: статус {response.status}")
-                            if attempt < max_attempts - 1 and response.status >= 500:
-                                await asyncio.sleep(2)
-                                continue
+        :param company: Объект с данными о компании
+        :return: Обновленный объект с данными о компании или None в случае ошибки
+        :raises ApiLimitExceeded: Если превышен лимит API запросов
+        """
+        # Проверяем, не превышен ли дневной лимит запросов
+        if self.api_requests_count >= self.api_daily_limit:
+            self.logger.warning(f"Превышен дневной лимит API запросов ({self.api_daily_limit}). Прерываем обработку.")
+            raise ApiLimitExceeded(f"Превышен дневной лимит API запросов ({self.api_daily_limit})")
+        
+        # Получаем API ключ
+        api_key = self.checko_keys.get_current_key()
+        if not api_key:
+            self.logger.error("Нет доступных API ключей Checko")
+            return None
+        
+        try:
+            # Формируем URL для запроса по ИНН с API ключом
+            params = {
+                'key': api_key,
+                'inn': company.inn
+            }
+            
+            # Увеличиваем счетчик API запросов
+            if not self._increment_api_counter():
+                self.logger.warning(f"Превышен дневной лимит API запросов. Прерываем обработку.")
+                raise ApiLimitExceeded(f"Превышен дневной лимит API запросов ({self.api_daily_limit})")
+            
+            async with aiohttp.ClientSession() as session:
+                # Выполняем прямой запрос к API
+                async with session.get(self.api_url, params=params, headers=self.headers) as response:
+                    if response.status != 200:
+                        self.logger.warning(f"Ошибка при запросе к API Checko для компании {company.inn}: статус {response.status}")
+                        
+                        # Обработка ошибок API
+                        if response.status == 403:  # Forbidden - проблема с API ключом
+                            self.logger.warning("Ошибка доступа (403). Проверьте правильность API ключа Checko")
+                            
+                            # Пробуем другой ключ, если есть
+                            if self.checko_keys.get_all_keys_count() > 1:
+                                self.logger.info("Пробуем другой API ключ Checko")
+                                self.checko_keys.rotate_key()
+                                # Пробуем снова с новым ключом
+                                return await self.parse_company(company)
+                            
                             return None
-                        
-                        html = await response.text()
-                        soup = BeautifulSoup(html, 'html.parser')
-                        
-                        # Ищем ссылку на страницу компании
-                        company_link = soup.select_one('a.jss198')
-                        if not company_link:
-                            self.logger.warning(f"Компания {company.inn} не найдена на checko.ru")
-                            return None
-                        
-                        company_href = company_link.get('href')
-                        if not company_href:
-                            return None
-                        
-                        company_url = f"https://checko.ru{company_href}"
-                        
-                        # Переходим на страницу компании
-                        async with session.get(company_url, headers=self.headers) as company_response:
-                            if company_response.status != 200:
-                                self.logger.warning(f"Ошибка при получении данных компании {company.inn}: статус {company_response.status}")
-                                if attempt < max_attempts - 1 and company_response.status >= 500:
-                                    await asyncio.sleep(2)
-                                    continue
-                                return None
                             
-                            company_html = await company_response.text()
-                            company_soup = BeautifulSoup(company_html, 'html.parser')
+                        elif response.status == 429:  # Too Many Requests - превышен лимит запросов
+                            self.logger.warning("Превышен лимит запросов к API Checko.ru")
+                            raise ApiLimitExceeded("Превышен лимит запросов к API Checko.ru (статус 429)")
                             
-                            # Ищем информацию о руководителе
-                            director_block = company_soup.select_one('div.jss294')
-                            if not director_block:
-                                self.logger.warning(f"Информация о руководителе компании {company.inn} не найдена")
-                                return None
-                            
-                            # Извлекаем имя директора
-                            director_name_elem = director_block.select_one('p.jss296')
-                            if director_name_elem:
-                                company.chairman_name = director_name_elem.text.strip()
-                            
-                            # ИНН директора обычно не представлен на странице checko.ru
-                            
+                        elif response.status == 404:  # Not Found - компания не найдена
+                            self.logger.warning(f"Компания с ИНН {company.inn} не найдена в API Checko")
+                            company.chairman_name = "не найдено"
+                            company.chairman_inn = "не найдено"
                             return company
-            except aiohttp.ClientError as e:
-                self.logger.error(f"Ошибка сети при парсинге компании {company.inn} на checko.ru: {e}")
-                if attempt < max_attempts - 1:
-                    await asyncio.sleep(2)
-                    continue
-            except Exception as e:
-                self.logger.error(f"Ошибка при парсинге компании {company.inn} на checko.ru: {e}")
-                if attempt < max_attempts - 1:
-                    await asyncio.sleep(2)
-                    continue
+                            
+                        elif response.status >= 500:  # Серверная ошибка
+                            self.logger.error(f"Серверная ошибка API Checko (статус {response.status})")
+                            return None
+                            
+                        return None
+                    
+                    # Получаем JSON ответ от API
+                    api_data = await response.json()
+                    
+                    # Проверяем наличие данных в ответе
+                    if not api_data or 'data' not in api_data:
+                        self.logger.warning(f"Пустой ответ от API или отсутствуют данные для компании {company.inn}")
+                        return None
+                    
+                    # Проверяем, есть ли информация о руководителе
+                    if 'data' in api_data and 'Руковод' in api_data['data'] and api_data['data']['Руковод'] and len(api_data['data']['Руковод']) > 0:
+                        # Берем первого руководителя из списка
+                        head = api_data['data']['Руковод'][0]
+                        
+                        # Извлекаем имя руководителя
+                        if 'ФИО' in head:
+                            company.chairman_name = head['ФИО']
+                            self.logger.info(f"Извлечено имя директора: {company.chairman_name}")
+                        
+                        # Извлекаем ИНН руководителя
+                        if 'ИНН' in head:
+                            company.chairman_inn = head['ИНН']
+                            self.logger.info(f"Извлечен ИНН директора: {company.chairman_inn}")
+                        else:
+                            company.chairman_inn = "не найдено"
+                            self.logger.warning(f"ИНН директора не найден для компании {company.inn}")
+                        
+                        return company
+                    else:
+                        self.logger.warning(f"Информация о руководителе не найдена для компании {company.inn}")
+                        company.chairman_name = "не найдено"
+                        company.chairman_inn = "не найдено"
+                        return company
+                        
+        except aiohttp.ClientError as e:
+            self.logger.error(f"Ошибка сети при запросе к API Checko для компании {company.inn}: {e}")
+        except json.JSONDecodeError as e:
+            self.logger.error(f"Ошибка декодирования JSON из ответа API Checko: {e}")
+        except Exception as e:
+            self.logger.error(f"Непредвиденная ошибка при работе с API Checko для компании {company.inn}: {e}")
         
         return None
+        
+    def _get_data_manager(self) -> Optional[DataManager]:
+        """
+        Получает объект DataManager из текущего экземпляра BaseSiteParser
+        через поиск в родительских объектах
+        
+        :return: Экземпляр DataManager или None
+        """
+        try:
+            # Получаем доступ к родительскому объекту ParserManager
+            frame = sys._getframe(2)
+            while frame:
+                if 'self' in frame.f_locals:
+                    parser_manager = frame.f_locals['self']
+                    if hasattr(parser_manager, 'data_manager'):
+                        return parser_manager.data_manager
+                frame = frame.f_back
+        except Exception as e:
+            self.logger.debug(f"Не удалось получить доступ к data_manager: {e}")
+        return None
+
+    def _load_api_requests_counter(self) -> None:
+        """
+        Загружает информацию о количестве использованных запросов из кеша
+        """
+        try:
+            cache_file = "checko_api_counter.json"
+            if os.path.exists(cache_file):
+                with open(cache_file, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                    
+                    # Проверяем, что данные актуальны (сегодняшняя дата)
+                    today = datetime.now().strftime("%Y-%m-%d")
+                    if data.get("date") == today:
+                        self.api_requests_count = data.get("count", 0)
+                        self.logger.info(f"Загружен счетчик API запросов: {self.api_requests_count}/{self.api_daily_limit}")
+                    else:
+                        # Если данные устарели, сбрасываем счетчик
+                        self.api_requests_count = 0
+                        self.logger.info(f"Счетчик API запросов сброшен (новый день)")
+        except Exception as e:
+            self.logger.error(f"Ошибка при загрузке счетчика API запросов: {e}")
+            self.api_requests_count = 0
+    
+    def _save_api_requests_counter(self) -> None:
+        """
+        Сохраняет информацию о количестве использованных запросов в кеш
+        """
+        try:
+            cache_file = "checko_api_counter.json"
+            today = datetime.now().strftime("%Y-%m-%d")
+            data = {
+                "date": today,
+                "count": self.api_requests_count
+            }
+            
+            with open(cache_file, "w", encoding="utf-8") as f:
+                json.dump(data, f)
+        except Exception as e:
+            self.logger.error(f"Ошибка при сохранении счетчика API запросов: {e}")
+    
+    def _increment_api_counter(self) -> bool:
+        """
+        Увеличивает счетчик использованных API запросов
+        
+        :return: True, если лимит не превышен, False в противном случае
+        """
+        self.api_requests_count += 1
+        
+        # Сохраняем обновленный счетчик
+        self._save_api_requests_counter()
+        
+        remaining = self.api_daily_limit - self.api_requests_count
+        self.logger.info(f"Использовано {self.api_requests_count}/{self.api_daily_limit} API запросов, осталось: {remaining}")
+        
+        # Проверяем, не превышен ли лимит
+        if self.api_requests_count >= self.api_daily_limit:
+            self.logger.warning(f"Достигнут дневной лимит API запросов ({self.api_daily_limit})")
+            return False
+        
+        return True
 
 class ZaChestnyiBiznesParser(BaseSiteParser):
     """Парсер для сайта zachestnyibiznes.ru"""
@@ -1335,12 +1574,13 @@ class DadataParser(BaseSiteParser):
                     if result:
                         result.source = self.site_name
                         results.append(result)
-                        self.logger.info(f"Успешно получены данные для {company.name}")
                         
-                        # Обновляем результаты в data_manager если он доступен
-                        if data_manager:
-                            data_manager.update_results(result)
-                    else:
+                        # Проверяем, был ли достигнут лимит API
+                        if result.chairman_name == "лимит API исчерпан":
+                            self.logger.warning(f"Компания {company.name} помечена как 'лимит API исчерпан'")
+                        else:
+                            self.logger.info(f"Успешно получены данные для {company.name}")
+                        
                         self.logger.warning(f"Не удалось получить данные для {company.name}")
                         
                 except Exception as e:

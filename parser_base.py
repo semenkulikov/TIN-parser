@@ -421,115 +421,204 @@ class ParserManager:
         return parser_companies
     
     async def process_batch(self, parser: BaseSiteParser, companies: List[CompanyData]) -> None:
-        """Обработка пакета компаний одним парсером"""
+        """
+        Обрабатывает пакет компаний через указанный парсер асинхронно
+        
+        :param parser: Парсер сайта
+        :param companies: Список компаний для обработки
+        """
         try:
-            results = await parser.parse_companies(companies)
-            self.logger.info(f"Парсер {parser.site_name} завершил обработку пакета, обработано: {len(results)} компаний")
+            # Обрабатываем список компаний через парсер
+            self.logger.info(f"Запуск обработки {len(companies)} компаний через {parser.__class__.__name__}")
+            from site_parsers import ApiLimitExceeded
             
-            # Обновляем результаты
-            for company in results:
-                self.data_manager.update_results(company)
+            try:
+                results = await parser.parse_companies(companies)
+                self.logger.info(f"Обработано {len(results)} компаний через {parser.__class__.__name__}")
                 
-            # Принудительно сохраняем результаты после каждого пакета
-            self.data_manager.save_results(force=True)
+                # Сохраняем полученные результаты
+                for result in results:
+                    self.data_manager.update_results(result)
+            except ApiLimitExceeded as e:
+                self.logger.warning(f"Обработка остановлена: {e.message}")
+                # Принудительно сохраняем результаты
+                self.data_manager.save_results(force=True)
+                # Устанавливаем флаг для остановки всего процесса
+                self.should_stop = True
+                
         except Exception as e:
-            self.logger.error(f"Ошибка при обработке пакета парсером {parser.site_name}: {e}")
-    
+            self.logger.error(f"Ошибка при обработке пакета через {parser.__class__.__name__}: {e}")
+
     def process_batch_sync(self, parser: BaseSiteParser, companies: List[CompanyData]) -> None:
-        """ Синхронная обертка, инициализирует запуск парсера. """
+        """
+        Обрабатывает пакет компаний через указанный парсер синхронно
+        
+        :param parser: Парсер сайта
+        :param companies: Список компаний для обработки
+        """
         try:
-            results = asyncio.run(parser.parse_companies(companies))
-            self.logger.info(f"Парсер {parser.site_name} завершил обработку пакета")
+            # Запускаем задачу асинхронной обработки
+            import asyncio
+            from site_parsers import ApiLimitExceeded
             
-            # Обновляем результаты
-            for company in results:
-                self.data_manager.update_results(company)
-                
-            # Принудительно сохраняем результаты после каждого пакета
-            self.data_manager.save_results(force=True)
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+            
+            try:
+                loop.run_until_complete(self.process_batch(parser, companies))
+            except ApiLimitExceeded as e:
+                self.logger.warning(f"Обработка остановлена: {e.message}")
+                # Принудительно сохраняем результаты
+                self.data_manager.save_results(force=True)
+                # Устанавливаем флаг для остановки всего процесса
+                self.should_stop = True
+            finally:
+                loop.close()
         except Exception as e:
-            self.logger.error(f"Ошибка при обработке пакета парсером {parser.site_name}: {e}")
-    
+            self.logger.error(f"Ошибка при синхронной обработке пакета через {parser.__class__.__name__}: {e}")
+
     async def run(self) -> None:
-        """Запуск процесса парсинга"""
-        self.logger.info("Начало процесса парсинга")
+        """
+        Запускает процесс парсинга данных
+        """
+        self.logger.info(f"Начало процесса парсинга")
         
-        # Получаем компании для обработки
+        # Получаем список компаний для обработки
         companies = self.data_manager.get_companies_to_process()
+        
         if not companies:
-            self.logger.info("Нет компаний для обработки")
+            self.logger.warning(f"Нет компаний для обработки")
             return
+            
+        # Распределяем компании по парсерам
+        distribution = self.distribute_companies(companies)
         
-        # Распределяем компании между парсерами
-        parser_companies = self.distribute_companies(companies)
-        
-        # # Обрабатываем компании пакетами
-        # tasks = []
-        # for parser, assigned_companies in parser_companies.items():
-        #     if not assigned_companies:
-        #         continue
-                
-        #     # Разбиваем компании на пакеты для каждого парсера
-        #     for i in range(0, len(assigned_companies), self.batch_size):
-        #         batch = assigned_companies[i:i+self.batch_size]
-        #         task = asyncio.create_task(self.process_batch(parser, batch))
-        #         tasks.append(task)
-        
-        # # Ожидаем завершения всех задач
-        # if tasks:
-        #     await asyncio.gather(*tasks)
-
+        # Создаем список задач для обработки компаний
         tasks = []
-        self.logger.info(f"Запуск обработки с {self.max_workers} параллельными процессами")
-        with concurrent.futures.ProcessPoolExecutor(max_workers=self.max_workers) as executor:
-            loop = asyncio.get_event_loop()
-            for parser, assigned_companies in parser_companies.items():
-                if not assigned_companies:
-                    continue
-
-                # Получаем все доступные API ключи для Dadata, если парсер - DadataParser
-                dadata_keys = []
-                if parser.__class__.__name__ == "DadataParser" and hasattr(parser, "dadata_keys"):
-                    for i in range(parser.dadata_keys.get_all_keys_count()):
-                        if i == 0:
-                            dadata_keys.append(parser.primary_token)
-                        else:
-                            key = os.getenv(f"DADATA_TOKEN_{i}")
-                            if key:
-                                dadata_keys.append(key)
-                    
-                    self.logger.info(f"Найдено {len(dadata_keys)} API ключей для распределения между пакетами")
-
-                # Разбиваем компании на пакеты
-                batches = [assigned_companies[i:i + self.batch_size] for i in range(0, len(assigned_companies), self.batch_size)]
-                
-                # Если у нас DadataParser, создаём отдельный экземпляр для каждого пакета с отдельным ключом
-                if parser.__class__.__name__ == "DadataParser" and dadata_keys:
-                    for batch_idx, batch in enumerate(batches):
-                        # Выбираем ключ для этого пакета (циклически)
-                        key_idx = batch_idx % len(dadata_keys)
-                        api_key = dadata_keys[key_idx]
-                        
-                        # Создаём новый экземпляр парсера для этого пакета с выбранным ключом
-                        from site_parsers import DadataParser
-                        batch_parser = DadataParser(token=api_key, rate_limit=parser.rate_limit)
-                        # Принудительно устанавливаем ключ для этого экземпляра
-                        batch_parser.set_specific_token(api_key)
-                        
-                        self.logger.info(f"Пакет {batch_idx+1} будет использовать ключ {key_idx+1}/{len(dadata_keys)}")
-                        
-                        # Добавляем задачу с новым экземпляром парсера
-                        task = loop.run_in_executor(executor, self.process_batch_sync, batch_parser, batch)
-                        tasks.append(task)
-                else:
-                    # Для других типов парсеров обрабатываем как обычно
-                    for batch in batches:
-                        task = loop.run_in_executor(executor, self.process_batch_sync, parser, batch)
-                        tasks.append(task)
-
-            if tasks:
-                await asyncio.gather(*tasks)
         
-        # Финальное сохранение результатов
+        # Добавляем флаг для остановки процесса при превышении лимита API
+        self.should_stop = False
+        
+        # Запускаем обработку через все парсеры
+        for parser, companies_batch in distribution.items():
+            if not companies_batch:
+                continue
+                
+            self.logger.info(f"Создаем задачу для парсера {parser.__class__.__name__} с {len(companies_batch)} компаниями")
+            
+            # Если у нас есть несколько парсеров с API ключами Checko, группируем задачи по ключам
+            if parser.__class__.__name__ == "CheckoParser" and hasattr(parser, "checko_keys"):
+                # Получаем все доступные API ключи для Checko, если парсер - CheckoParser
+                checko_keys = []
+                if parser.__class__.__name__ == "CheckoParser" and hasattr(parser, "checko_keys"):
+                    # Используем only_env=True для загрузки ключей только из переменных окружения
+                    checko_keys = [parser.checko_keys.get_current_key()]
+                    
+                    # Загружаем дополнительные ключи из переменных окружения
+                    i = 1
+                    while True:
+                        key = os.getenv(f"CHECKO_TOKEN_{i}")
+                        if not key:
+                            break
+                        checko_keys.append(key)
+                        i += 1
+                    
+                    if checko_keys:
+                        self.logger.info(f"Найдено {len(checko_keys)} API ключей Checko")
+                    else:
+                        self.logger.warning(f"Не найдено API ключей Checko")
+                        
+                # Распределяем компании по API ключам
+                if checko_keys:
+                    # Если API ключ один, используем его для всех компаний
+                    if len(checko_keys) == 1:
+                        self.logger.info(f"Используем единственный ключ Checko для всех {len(companies_batch)} компаний (лимит 100 запросов в сутки)")
+                        tasks.append(self.process_batch(parser, companies_batch))
+                    else:
+                        # Если API ключей несколько, распределяем компании по ключам
+                        self.logger.info(f"Распределяем компании по {len(checko_keys)} API ключам Checko")
+                        
+                        # Распределяем компании равномерно по ключам (до 100 компаний на ключ)
+                        chunk_size = min(100, len(companies_batch) // len(checko_keys) + 1)
+                        chunks = [companies_batch[i:i + chunk_size] for i in range(0, len(companies_batch), chunk_size)]
+                        
+                        # Создаем по одной задаче на каждый ключ
+                        for i, chunk in enumerate(chunks):
+                            if i < len(checko_keys):
+                                # Выбираем ключ для этого пакета (циклически)
+                                key_index = i % len(checko_keys)
+                                key = checko_keys[key_index]
+                                
+                                # Создаем новый экземпляр парсера с этим ключом
+                                import importlib
+                                module = importlib.import_module(parser.__class__.__module__)
+                                parser_class = getattr(module, parser.__class__.__name__)
+                                new_parser = parser_class(token=key)
+                                
+                                self.logger.info(f"Создаем задачу для ключа {key_index+1}/{len(checko_keys)} с {len(chunk)} компаниями")
+                                tasks.append(self.process_batch(new_parser, chunk))
+                else:
+                    # Если ключей нет, просто обрабатываем все компании через имеющийся парсер
+                    tasks.append(self.process_batch(parser, companies_batch))
+            else:
+                # Для всех остальных парсеров - просто добавляем задачу
+                tasks.append(self.process_batch(parser, companies_batch))
+        
+        # Запускаем все задачи с учетом ограничений на количество параллельных процессов
+        from concurrent.futures import ProcessPoolExecutor
+        
+        # Определяем количество параллельных процессов (учитываем ограничения API и CPU)
+        max_workers = min(
+            int(os.getenv('MAX_WORKERS', os.cpu_count() or 4)),  # Ограничение по CPU
+            10  # Верхняя граница параллельных процессов
+        )
+        
+        # Если у нас есть парсеры с API лимитами, ограничиваем количество процессов
+        has_api_parsers = any(
+            parser.__class__.__name__ in ["CheckoParser", "DadataParser"] 
+            for parser in distribution.keys()
+        )
+        
+        if has_api_parsers:
+            # Ограничиваем до 2-4 процессов для API-парсеров
+            max_workers = min(max_workers, int(os.getenv('API_MAX_WORKERS', 2)))
+            self.logger.info(f"Установлено максимальное количество параллельных процессов: {max_workers} для сохранения лимита API-запросов")
+        
+        # Если задача только одна или параллелизм отключен, запускаем задачи последовательно
+        if max_workers <= 1 or len(tasks) <= 1:
+            for task in tasks:
+                # Проверяем флаг остановки
+                if self.should_stop:
+                    self.logger.warning("Обработка остановлена из-за превышения лимита API")
+                    break
+                await task
+        else:
+            # Используем процессы для распараллеливания задач
+            with ProcessPoolExecutor(max_workers=max_workers) as executor:
+                # Оборачиваем каждую задачу в синхронную функцию для ProcessPoolExecutor
+                futures = []
+                
+                for i, (parser, companies_batch) in enumerate(distribution.items()):
+                    if not companies_batch:
+                        continue
+                    
+                    # Проверяем флаг остановки
+                    if self.should_stop:
+                        self.logger.warning("Обработка остановлена из-за превышения лимита API")
+                        break
+                        
+                    # Запускаем обработку в отдельном процессе
+                    future = executor.submit(self.process_batch_sync, parser, companies_batch)
+                    futures.append(future)
+                
+                # Ожидаем завершения всех задач
+                for future in futures:
+                    try:
+                        future.result()
+                    except Exception as e:
+                        self.logger.error(f"Ошибка при выполнении задачи: {e}")
+        
+        # Сохраняем результаты
         self.data_manager.save_results(force=True)
-        self.logger.info("Процесс парсинга завершен") 
+        
+        self.logger.info(f"Завершение процесса парсинга") 
