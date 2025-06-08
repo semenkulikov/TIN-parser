@@ -64,6 +64,7 @@ def load_api_keys(env_prefix):
 # Функция для форсированного сохранения при любом завершении
 @atexit.register
 def save_on_exit():
+    """ Функция для сохранения результатов парсинга в случае экстренного завершения программы """
     global data_manager, is_saving, is_exiting
     if data_manager and not is_saving and not is_exiting:
         try:
