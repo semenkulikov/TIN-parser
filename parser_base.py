@@ -57,6 +57,7 @@ class DataManager:
     """Менеджер данных для работы с Excel и сохранением результатов"""
     
     def __init__(self, input_file: str, output_file: str = "results.csv", save_interval: int = 2):
+        """ Метод для инициализации менеджера """
         self.input_file = input_file
         self.output_file = output_file
         self.cache_file = "parsed_data_cache.json"
