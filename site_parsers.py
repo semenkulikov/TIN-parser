@@ -948,6 +948,7 @@ class AuditItParser(BaseSiteParser):
     """Парсер для сайта audit-it.ru"""
     
     def __init__(self, rate_limit: float = 2.0):
+        """ Метод для инициализации класса """
         super().__init__(rate_limit)
         self.site_name = "www.audit-it.ru"
         self.search_url = "https://www.audit-it.ru/contragent"
