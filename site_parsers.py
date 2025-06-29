@@ -1018,7 +1018,7 @@ class AuditItParser(BaseSiteParser):
                 try:
                     # Проверяем на прерывание программы перед каждой компанией
                     try:
-                        # Используем asyncio.sleep с очень маленьким таймаутом для проверки прерываний
+                        
                         await asyncio.sleep(0.01)
                     except asyncio.CancelledError:
                         self.logger.info("Обнаружено прерывание, останавливаем парсинг")
@@ -1081,11 +1081,6 @@ class AuditItParser(BaseSiteParser):
                         company.chairman_name = "не найдено"
                         company.chairman_inn = "не найдено"
                         return company
-                
-                # Проверка на блокировку
-                # if "вы превысили лимит запросов к серверу" in self.driver.page_source.lower():
-                #     self.logger.warning(f"Сайт focus.kontur.ru заблокировал парсер.")
-                #     return None
 
                 
                 # Ждем загрузки поля поиска
